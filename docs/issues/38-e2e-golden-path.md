@@ -79,7 +79,11 @@ logic-measurable (here) and hardware-measurable (QA doc).
 
 ## Dependencies
 
-28 (uses 17; touches `docs/QA_CHECKLIST.md` co-owned with 40).
+28.
+(Coordination notes, not prerequisites: the suite runs against the FakeCodex
+fixture from 17, which 28 already requires; the hardware-measurement section
+this issue adds to `docs/QA_CHECKLIST.md` is later folded into issue 40's
+full QA document.)
 
 ## Non-goals
 

@@ -101,7 +101,9 @@ manual checklist + screenshots.
 
 ## Dependencies
 
-03, 04, 08, 10, 11, 30 (+ scene opened from 29's menu).
+03, 04, 08, 10, 11, 30.
+(Coordination note, not a prerequisite: the menu item that opens this scene
+is rendered by issue 29.)
 
 ## Non-goals
 
