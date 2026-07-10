@@ -4,95 +4,115 @@ Onboarding flow: permissions, speech assets, codex preflight, demo session
 
 ## Summary
 
-Implement the 7-step onboarding window of DESIGN §8.4, ending with a scripted
-hands-free demo session against a bundled FakeCodex — the user's risk-free
-first loop.
+Implement the 7-step onboarding of DESIGN §8.4 as a standalone window,
+ending with a scripted hands-free demo session against the bundled
+FakeCodex — plus the `OnboardingPresenting` implementation for issue 29's
+seam and the make-app.sh amendment that bundles `fake-codex`.
 
 ## Context
 
-Onboarding carries the privacy story (what stays on device), collects the
-mic/speech permissions with correct TCC attribution, repairs the two
-research-confirmed out-of-box gaps (missing en STT assets, compact-only TTS
-voices), and verifies codex before the first real task.
+Onboarding carries the privacy story (on-device speech; network = codex
+traffic + user-initiated Apple asset downloads — amended DESIGN §8.4),
+collects TCC permissions with correct bundle attribution, repairs the two
+research-confirmed out-of-box gaps (missing en assets, compact-only
+voices), and verifies codex before the first real task. The demo must never
+touch the real codex path pinning (T6) or the user's projects.
 
 ## Scope
 
-- Onboarding window + step flow + demo-session mode + make-app.sh amendment to
-  bundle `fake-codex`. Uses existing components (08/10/13/25/30/17/28).
+- Onboarding window + step flow + demo-session mode + `OnboardingPresenting`
+  impl + make-app.sh amendment (05). Uses 08/10/13/17/25/28/30/31 APIs.
 
 ## Detailed Requirements
 
-1. Window: 640×480 sheet-style, linear steps with Back/Continue, re-runnable
-   from the menu ("Run Onboarding…"). Progress dots. Steps may be skipped
-   only where noted; completion state stored in config
-   (`general.onboarding_completed: Bool` — add key, update DESIGN C.2).
-2. Steps (exact order, DESIGN §8.4):
-   1. **Welcome/privacy**: static copy — speech processed on-device; the only
-      network traffic is codex's own under the user's account; transcripts
-      local with retention link to Settings. (Copy reviewed against
-      PRIVACY.md in issue 40 — placeholder constant now.)
-   2. **Microphone permission**: explain → request via a short
-      `AudioEngineManager.start()/stop()` probe (triggers TCC); denied state
-      shows "Open System Settings → Privacy → Microphone" deep link +
-      re-check button. Speech-recognition permission is requested here too if
-      08's findings require it (this issue consumes 08's documented answer).
-      Not skippable while denied (Continue disabled; Quit-onboarding allowed).
-   3. **STT assets**: per selected language mode (config from a language
-      picker on this step): availability + Download with progress (08).
-      Skippable only if at least one locale is `.available`.
-   4. **TTS voices**: current voice + quality label; if compact-only,
-      System Settings guidance (32's fallback pattern) + preview button.
-      Skippable.
-   5. **Codex preflight**: run 13; render found/version/auth states with fix
-      guidance (`codex login` copy). Skippable with warning ("you can finish
-      setup in Settings → Agent"; dispatch stays gated by preflight anyway).
-   6. **First project**: folder picker → registry add (25) with inline
-      validation; set as default. Skippable if registry non-empty.
-   7. **Hotkey + demo**: show current hotkey (rebind link → Settings);
-      "Try it now" starts a REAL orchestrator session in **demo mode**:
-      adapter's codexPath pointed at the bundled `fake-codex` with
-      `FAKE_CODEX_SCENARIO=demo-ja|demo-en` (by session locale) and project =
-      a temp scratch git dir created for the demo (never the user's project).
+1. Container: standalone `NSWindow` (640×480, non-resizable, regular level;
+   NOT an AppKit sheet — there is no parent window in an LSUIElement app),
+   presented by the `OnboardingPresenting` implementation registered into
+   issue 29's seam; auto-presents on boot when
+   `general.onboarding_completed == false`; re-runnable from the menu.
+   Linear steps with Back/Continue + progress dots; completion sets the
+   config flag.
+2. Steps (exact order; each step catches its component errors and renders
+   retry guidance — onboarding never crashes the app):
+   1. **Welcome/privacy** — copy verbatim from DESIGN §8.4 step 1 (amended:
+      mentions user-initiated speech-asset downloads).
+   2. **Microphone permission** — explain, then trigger TCC via a short
+      `AudioEngineManager.start()/stop()` probe; denied → "Open System
+      Settings → Privacy → Microphone" + re-check button; Continue disabled
+      while denied (Quit-onboarding allowed). Speech-recognition permission
+      is requested here IFF issue 08's pinned findings say the API demands
+      it (this issue consumes 08's documented answer; the manual oracle is
+      conditional accordingly).
+   3. **STT assets** — language picker writes `general.locale_mode`;
+      asset rows per locale with the mapping: mode `ja` → ja-JP required;
+      `en` → en-US required; `auto` → BOTH rows shown, at least one
+      installed required to continue (the session locale rule stays
+      DESIGN §5.x: auto resolves at session start). Download buttons drive
+      `prepare()` with `preparationProgress`.
+   4. **TTS voices** — current voice + quality label; compact-only state →
+      System Settings guidance reusing 32's fallback pattern; preview
+      button. Skippable.
+   5. **Codex preflight** — render found/version/auth with fix guidance
+      (`codex login` copy). Skippable with warning (dispatch remains gated
+      by preflight anyway).
+   6. **First project** — folder picker → registry add (25) with inline
+      problems; sets default. Skippable if registry non-empty.
+   7. **Hotkey + demo** — show current hotkey (rebind link → Settings);
+      "Try it now" runs a REAL orchestrator session in **demo mode**:
+      - `orchestrator.mode = .demo` for the session; HUD shows the Demo
+        badge (31);
+      - the adapter is constructed with a **session-scoped codexPath
+        override** pointing at the bundled `fake-codex`
+        (`Bundle.main.bundleURL/Contents/MacOS/fake-codex`) and
+        `FAKE_CODEX_SCENARIO=demo-ja|demo-en` by session locale — this
+        override is in-memory only: it is NEVER written to
+        `agent.codex_path`/`codex_path_confirmed_path` and never passes
+        through CodexPreflight pinning (T6 assertion in tests);
+      - demo project = a unique temp directory created for the demo,
+        `git init`-ed before dispatch (projects must be git repos), passed
+        via `-C`, NEVER added to the ProjectRegistry; removed at demo end
+        (retained with a log line if removal fails).
       The user speaks a suggested phrase, hears the scripted summary,
-      practices 「終了」. A "Demo" badge shows on the HUD during demo mode
-      (visible distinction is a MUST — orchestrator gains a
-      `mode: .normal|.demo` flag surfaced to HUD/menu).
-3. `scripts/make-app.sh` amendment (05): build + copy `fake-codex` into
-   `Contents/MacOS/fake-codex` (both dev and release bundles; ~small binary).
-   Demo mode resolves it relative to the main executable path.
-4. Auto-open on first launch (29 hook) when `onboarding_completed=false`.
-5. Failure resilience: every step catches its component errors and renders
-   retry guidance; onboarding never crashes the app (DESIGN §12).
+      practices 「終了」.
+3. `scripts/make-app.sh` amendment (05): build the `fake-codex` product and
+   copy it to `Contents/MacOS/fake-codex` in both dev and release bundles
+   (39's sign.sh already discovers nested executables).
+4. Failure resilience: per-step typed error → inline retry UI (asset
+   download no-network, preflight missing binary, mic denied, demo spawn
+   failure).
 
 ## Acceptance Criteria
 
-- [ ] Step-flow view-model tests: gating rules (mic step blocks, skip rules),
-      completion flag persistence, re-run behavior.
-- [ ] Demo mode: E2E test at orchestrator level (mock speech + real adapter +
-      fake-codex `demo-en`) asserting demo badge state, scratch-dir isolation
-      (user registry untouched), and scripted summary spoken.
-- [ ] Manual full pass on the dev machine from a reset state
-      (`tccutil reset Microphone <bundle-id>` + fresh config): all 7 steps,
-      both TCC prompts correctly attributed to "Handsfree", ja demo heard.
-      Checklist + screenshots in PR.
+- [ ] Step-flow VM tests: gating rules (mic blocks, per-mode asset
+      requirements incl. `auto`, skip rules), completion flag, re-run.
+- [ ] Demo E2E test (orchestrator + mock speech + real adapter +
+      fake-codex `demo-en`): demo badge state set; user registry and
+      `agent.codex_path*` config keys UNCHANGED after the demo (T6
+      assertions); scratch dir created+git-inited+cleaned; scripted summary
+      spoken.
 - [ ] make-app.sh bundles fake-codex; `codesign --verify --strict` still
-      passes (nested binary signed in 39's flow; ad-hoc here).
-- [ ] Denied-mic path renders recovery UI and re-check works after granting.
+      passes on the ad-hoc bundle.
+- [ ] Manual full pass from a reset state (`tccutil reset Microphone
+      <bundle-id>`, fresh config): all 7 steps; mic TCC prompt attributes to
+      "Handsfree"; speech-recognition prompt appears/absent exactly per
+      issue 08's pinned finding; ja demo heard. Checklist + screenshots.
+- [ ] Denied-mic recovery path works after granting in System Settings.
 
 ## Validation
 
-`swift test --filter OnboardingFlowTests DemoModeE2ETests`; manual reset-state
-checklist in PR.
+`swift test --filter 'OnboardingFlowTests|DemoModeE2ETests'`; manual
+reset-state checklist in PR.
 
 ## Dependencies
 
-08, 10, 13, 17, 25, 30 (+ amends 05; uses 28).
+05, 08, 10, 13, 17, 25, 28, 30, 31.
 
 ## Non-goals
 
-Account creation of any kind, codex installation/login automation, analytics
-about onboarding completion (no telemetry).
+Account creation, codex install/login automation, telemetry, wake-word
+teaching.
 
 ## Design References
 
-DESIGN.md §8.4, §9.3, §12; research doc (assets/voices gaps); ADR-003.
+DESIGN.md §8.4 (amended), §9.2 (T6), §9.3, §12; research doc (asset/voice
+gaps); ADR-003; issue 28 (mode API), 31 (demo badge).

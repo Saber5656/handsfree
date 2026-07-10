@@ -5,74 +5,104 @@ STTProvider/VADProvider protocols, result types, and scriptable mocks
 ## Summary
 
 Define the speech-to-text and voice-activity-detection provider protocols and
-data types exactly as DESIGN §4.2/§4.3, plus deterministic mock
-implementations in a new `HandsfreeTestSupport` target used by all later
-orchestrator and E2E tests.
+their concrete data types (per DESIGN §4.2/§4.3, exact declarations below),
+plus deterministic mocks in `HandsfreeTestSupport`.
 
 ## Context
 
 Provider abstraction is the load-bearing decision of ADR-003: Apple providers
 now, cloud/whisper later, mocks for CI. The orchestrator (28) and golden-path
-suite (38) are written entirely against these protocols.
+suite (38) are written against these protocols. The `HandsfreeTestSupport`
+target and `TestClock` already exist (issue 01).
 
 ## Scope
 
-- Protocols + types in `HandsfreeSpeech` (STT/, VAD/).
-- New SwiftPM target `HandsfreeTestSupport` (library) added to `Package.swift`,
-  depended on **only by test targets**; contains `MockSTTProvider`,
-  `MockVADProvider` (and later mocks from issues 10/17).
-- Not: Apple implementations (08/09), audio capture (06).
+- Protocols + types in `HandsfreeSpeech` (STT/, VAD/); `MockSTTProvider` and
+  `MockVADProvider` in `HandsfreeTestSupport`. Not: Apple implementations
+  (08/09), audio capture (06).
 
 ## Detailed Requirements
 
-1. Types/protocols exactly per DESIGN §4.2 (`STTProvider`, `STTResult`,
-   `STTAvailability`, `STTProviderID`) — copy the signatures; deviations
-   require a DESIGN.md update in the same PR.
-2. `VADProvider` protocol:
+1. Exact declarations (deviations require a DESIGN.md §4.2 update in the
+   same PR):
    ```swift
+   public struct STTProviderID: RawRepresentable, Hashable, Sendable {
+       public let rawValue: String            // "apple"
+   }
+   public enum STTAvailability: Equatable, Sendable {
+       case available
+       case assetDownloadRequired(estimatedBytes: Int64?)
+       case unsupportedLocale
+       case unauthorized
+   }
+   public protocol STTProvider: Sendable {
+       var id: STTProviderID { get }
+       func availability(locale: Locale) async -> STTAvailability
+       func prepare(locale: Locale) async throws
+       func startStream(locale: Locale, audio: AsyncStream<CapturedBuffer>)
+           -> AsyncThrowingStream<STTResult, Error>
+       func stopStream() async
+   }
+   public struct STTResult: Equatable, Sendable {
+       public let text: String
+       public let isFinal: Bool
+       public let confidence: Double?
+       public let audioRange: ClosedRange<TimeInterval>?
+   }
+   public enum VADVerdict: Equatable, Sendable {
+       case speech
+       case silence(total: Duration)   // contiguous silence measured since the
+                                       // last speech verdict (provider-resettable)
+   }
    public protocol VADProvider: Sendable {
-       func process(_ buffer: CapturedBuffer) async -> VADVerdict // .speech | .silence(duration)
+       func process(_ buffer: CapturedBuffer) async -> VADVerdict
        func reset() async
    }
    ```
-   (Endpointing *policy* is issue 09; this is the raw verdict source.)
-3. `MockSTTProvider`: initialized with a script
-   `[(delay: Duration, result: STTResult)]`; `startStream` replays the script
-   on a test clock; supports mid-stream error injection and cancellation
-   assertions (records whether `stopStream` was awaited).
-4. `MockVADProvider`: scripted verdicts keyed by buffer index.
-5. Both mocks record every call (`calls: [CallRecord]`) for behavioral asserts.
-6. Test clock: use `swift-testing` + a small `TestClock` utility in
-   `HandsfreeTestSupport` (hand-rolled, ~50 lines, no third-party dep) —
-   shared by FSM/timeout tests in later issues (21/22/26).
-7. Doc comments state threading/Sendable expectations: providers may be called
-   from any actor; streams finish on `stopStream`; providers must be
-   restartable (start→stop→start).
+2. Contract doc comments: providers callable from any actor; streams finish
+   on `stopStream`; providers are restartable (start→stop→start); exactly one
+   terminal (finish or throw) per stream.
+3. `MockSTTProvider` (TestSupport), fully specified:
+   ```swift
+   public enum MockSTTEvent { case result(after: Duration, STTResult)
+                              case fail(after: Duration, any Error) }
+   public final class MockSTTProvider: STTProvider {
+       public init(script: [MockSTTEvent], clock: TestClock)
+       public private(set) var startCalls: [(Locale)]
+       public private(set) var stopAwaited: Bool
+       public private(set) var preparedLocales: [Locale]
+       public var availabilityByLocale: [String: STTAvailability]  // settable
+   }
+   ```
+   Replays the script on the injected `TestClock`; `fail` throws out of the
+   stream; restartable (a second `startStream` replays from the script head).
+4. `MockVADProvider`: scripted verdicts keyed by buffer index
+   (`init(verdicts: [VADVerdict], clock: TestClock)`, default `.speech`
+   after script exhaustion), call recording, `reset()` counter.
+5. Target-graph oracle: production targets must not depend on
+   `HandsfreeTestSupport`; TestSupport may depend on Core/Speech/Agent; only
+   test targets depend on TestSupport (same script as issue 01 — rerun).
 
 ## Acceptance Criteria
 
-- [ ] Protocol signatures compile and match DESIGN §4.2 verbatim (reviewer
-      checks side-by-side; any change is reflected in DESIGN.md in the PR).
-- [ ] `HandsfreeTestSupport` is NOT a dependency of any production target
-      (assert via `swift package describe` in Validation).
-- [ ] Mock STT replay test: scripted volatile→final sequence arrives in order
-      with test-clock timing; error injection surfaces as stream throw.
-- [ ] Restartability test passes for both mocks.
-- [ ] `TestClock` supports advance/sleep semantics used by at least one
-      example timeout test in this PR.
+- [ ] Declarations compile exactly as specified (reviewer diff vs this
+      issue; DESIGN §4.2 already matches).
+- [ ] Mock STT replay: volatile→final ordering with TestClock timing; error
+      injection surfaces as stream throw; restartability proven.
+- [ ] Mock VAD: scripted sequence + exhaustion default + reset behavior.
+- [ ] Target-graph assertion output pasted in PR.
 
 ## Validation
 
-`swift test --filter MockSTTProviderTests` (and VAD equivalent);
-`swift package describe --type json` asserting TestSupport edges.
+`swift test --filter 'MockSTTProviderTests|MockVADProviderTests'`.
 
 ## Dependencies
 
-01.
+01, 06 (`CapturedBuffer`).
 
 ## Non-goals
 
-Apple/live providers, endpointing policy, locale asset management.
+Apple/live providers, endpointing policy (09), locale asset UI.
 
 ## Design References
 

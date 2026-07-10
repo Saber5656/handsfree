@@ -6,82 +6,88 @@ AppleSTTProvider: SpeechTranscriber streaming STT with asset management
 
 Implement the production `STTProvider` on the macOS 26 `SpeechAnalyzer` +
 `SpeechTranscriber` stack: streaming volatile/final results for ja-JP and
-en-US, locale asset install/download flow, and authorization handling.
+en-US, locale asset install flow, authorization handling, and the shared
+analyzer pipeline object that issue 09's VAD composes into.
 
 ## Context
 
-Research (2026-07-08) confirmed `SpeechTranscriber` supports ja-JP/en-* fully
-on-device on macOS 26, with per-locale downloadable assets via
-`AssetInventory`. This provider is the default and only STT in v1 (ADR-003,
-ADR-007). Known unknown #2: whether this path also requires legacy
-speech-recognition TCC — this issue must pin it empirically.
+Research (2026-07-08) confirmed on-device ja-JP/en-* support with per-locale
+downloadable assets (`AssetInventory`). This is the only STT in v1 (ADR-003,
+ADR-007). Known unknown #2 (whether legacy speech-recognition TCC is also
+required) is pinned empirically here.
 
 ## Scope
 
-- `HandsfreeSpeech/STT/AppleSTTProvider.swift` + asset manager + errors.
-- Not: endpointing (09), audio capture (06), onboarding UI (34).
+- `HandsfreeSpeech/STT/`: `AppleSTTProvider`, `SpeechPipeline` (shared
+  analyzer owner), asset manager, error taxonomy, seams. Not: endpointing
+  policy (09), capture (06), onboarding UI (34).
 
 ## Detailed Requirements
 
-1. Conform to `STTProvider` (07). Construction takes an
-   `AudioEngineManager`-produced buffer stream (`AsyncStream<CapturedBuffer>`);
-   internally convert buffers to the analyzer's expected input
-   (`AnalyzerInput`), respecting the transcriber's `bestAvailableAudioFormat`
-   (insert `AVAudioConverter` when formats differ).
-2. `availability(locale:)`:
-   - unsupported locale (not in `SpeechTranscriber.supportedLocales`) →
-     `.unsupportedLocale`
-   - supported but not in `installedLocales` → `.assetDownloadRequired(sizeEstimate?)`
-   - mic/speech authorization missing → `.unauthorized`
-   - else `.available`.
-3. `prepare(locale:)`: request authorization(s) as required, then drive
-   `AssetInventory` install with progress reporting via an
-   `AsyncStream<Double>` exposed as `preparationProgress` (consumed by
-   onboarding/Settings). Handle: no network (typed error), user cancel.
-4. `startStream`: build `SpeechAnalyzer` with a `SpeechTranscriber` module
-   configured for volatile + finalized results; map results to `STTResult`
-   (`isFinal`, text, confidence when available, audio time range). Locale is
-   fixed per stream (DESIGN §4.2; `auto` resolution happens in Core, not here).
-5. `stopStream`: finalize the analyzer cleanly so trailing audio yields a
-   final result before the stream ends (needed for endpointing correctness).
-6. Empirical authorization pinning (**must be in the PR description**): with
-   the ad-hoc bundle from issue 05, document which TCC prompts actually fire
-   (mic only, or mic + speech recognition), and adjust `availability` +
-   Info.plist docs accordingly; update DESIGN §16 known-unknown #2 as resolved
-   in the same PR.
-7. Errors (typed `STTError`): `notAuthorized`, `assetUnavailable`,
-   `analyzerFailed(underlying)`, `formatUnsupported` — each mapped to a spoken
-   error key later (28); log via `Log.stt`.
-8. All tests that hit the real framework are `live`-tagged; pure logic
-   (availability mapping, format conversion decision table) is unit-tested
-   with seams.
+1. Conform exactly to `STTProvider` (07). Internally, `startStream` builds a
+   `SpeechPipeline` object that owns the `SpeechAnalyzer` and its modules;
+   the pipeline exposes an attachment point for additional modules
+   (`SpeechDetector`, issue 09) WITHOUT changing this provider's public API.
+   Buffer conversion: consume `CapturedBuffer`s, convert via
+   `AVAudioConverter` when the native format differs from the transcriber's
+   `bestAvailableAudioFormat`, and feed `AnalyzerInput`s.
+2. `availability(locale:)` decision table:
+   not in `SpeechTranscriber.supportedLocales` → `.unsupportedLocale`;
+   supported but not in `installedLocales` → `.assetDownloadRequired(size?)`;
+   authorization missing → `.unauthorized`; else `.available`.
+3. `prepare(locale:)`: request required authorization(s), then drive
+   `AssetInventory` installation. Progress: expose
+   `public var preparationProgress: AsyncStream<Double>` — single active
+   consumer, emits 0…1 for the CURRENT prepare call, completes when prepare
+   returns/throws (documented; issues 32/34 consume it).
+4. `stopStream`: finalize the analyzer so trailing audio yields final
+   result(s) before the stream ends (endpointing correctness).
+5. Error taxonomy (complete): `STTError.notAuthorized`,
+   `.assetUnavailable(locale)`, `.assetDownloadFailed(underlying)`,
+   `.networkUnavailable`, `.cancelled`, `.analyzerFailed(underlying)`,
+   `.formatUnsupported` — each with a spoken-error template key constant.
+6. Seams (unit-testable decision logic): `SpeechAssetClient`
+   (supported/installed/install), `SpeechAuthorizationClient` (status/
+   request), `SpeechAnalyzerFactory` (pipeline construction). Fakes in
+   TestSupport; the availability table and error mapping are tested with
+   them. Real-stack tests live in `AppleSTTLiveTests` (issue-02 convention).
+7. Privacy rule: transcript text is never logged as public payload — log
+   metadata only (lengths, isFinal, locale). Raw audio is never persisted.
+8. **Authorization pinning (closes known unknown #2)**: using the issue-05
+   bundle, document in the PR which TCC prompts actually fire (mic only, or
+   mic + speech recognition); update `availability`'s `.unauthorized` logic
+   accordingly AND update DESIGN §16 #2 + research doc in the same PR.
 
 ## Acceptance Criteria
 
-- [ ] `live` manual test: with ja-JP assets installed, speaking a 5-second
-      Japanese sentence yields ≥1 volatile result and exactly one final result
-      whose text is non-empty; same for en-US (after `prepare` downloads it).
-- [ ] `availability` decision table unit-tested for all four outcomes.
-- [ ] `stopStream` mid-utterance still delivers a trailing final result
-      (`live` test).
-- [ ] Authorization findings documented + DESIGN §16 updated (known unknown #2
-      closed).
-- [ ] No network use besides Apple's own asset download; no audio persisted.
+- [ ] Availability decision table: all four outcomes unit-tested via seams.
+- [ ] Error mapping tests: asset download failure, no network, user cancel,
+      analyzer failure → correct `STTError` cases.
+- [ ] `AppleSTTLiveTests` (manual, from the assembled bundle): ja-JP
+      5-second utterance yields ≥ 1 volatile result and ≥ 1 final result with
+      non-empty aggregate final text; same for en-US after `prepare`
+      downloads it; `stopStream` mid-utterance still delivers trailing final
+      result(s).
+- [ ] `preparationProgress` emits monotonically increasing values ending at
+      1.0 on the live en-US download (or seam-simulated in CI).
+- [ ] TCC findings documented; DESIGN §16 #2 and research doc updated.
+- [ ] No public-privacy logging of transcript text (code review + grep note).
 
 ## Validation
 
-`swift test --filter AppleSTTAvailabilityTests`; `live` checklist run recorded
-in the PR (device, locale states, transcript samples ja+en).
+`swift test --filter AppleSTTProviderTests` (seam-based, CI-safe);
+`swift test --filter AppleSTTLiveTests` locally — checklist + transcript
+samples (ja/en) in the PR.
 
 ## Dependencies
 
-06, 07.
+05, 06, 07.
 
 ## Non-goals
 
-Custom vocabulary/biasing (known unknown #7 — separate issue if needed),
-per-utterance language auto-detection, cloud STT.
+Custom vocabulary/biasing (known unknown #7 — new issue if needed),
+per-utterance language auto-detection, cloud STT, VAD (09).
 
 ## Design References
 
-DESIGN.md §4.2, §12, §16 (#2, #7); ADR-003, ADR-007; research doc (speech stack).
+DESIGN.md §4.2, §12, §16 (#2, #7); ADR-003, ADR-007; research doc.

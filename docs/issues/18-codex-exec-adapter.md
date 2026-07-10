@@ -5,83 +5,97 @@ CodexExecAdapter: turn execution with tier flags, resume, and cancellation
 ## Summary
 
 Implement the production `AgentAdapter` composing preflight (13), process
-runner (14), JSONL decoder (15), and response contract (16): exact argv
-construction per risk tier, new/resume turns, cancellation, timeout, and
-outcome assembly — integration-tested against FakeCodex (17).
+runner (14), wire decoder (15), and contract parser (16): canonical argv per
+risk tier, new/resume turns, wire→domain event mapping, terminal outcome
+assembly, cancellation, and timeout — integration-tested against FakeCodex
+(17).
 
 ## Context
 
-This is the single execution path for all agent actions (ADR-002). Its argv
-table IS the enforcement of the approval policy (DESIGN §6.5): a bug here is a
-security bug (threat T7).
+Single execution path for all agent actions (ADR-002). The argv table IS the
+enforcement of the approval policy (DESIGN §6.5); a bug here is a security
+bug (T7). Terminal semantics follow the amended DESIGN §6.1: exactly one
+`turnEnded(TurnOutcome)` per turn.
 
 ## Scope
 
-- `HandsfreeAgent/Codex/CodexExecAdapter.swift` + argv builder + tests.
-- Not: approval decisions (21), task bookkeeping (26), prompt text (24).
+- `HandsfreeAgent/Codex/CodexExecAdapter.swift` + argv builder + wire-event
+  mapper + tests. Not: approval decisions (21), task bookkeeping (26),
+  prompt text (24).
 
 ## Detailed Requirements
 
-1. Argv builder (pure function, exhaustively unit-tested):
-   - Base (new turn):
-     `exec --json -C <projectPath> --output-schema <schemaResourcePath>
-     -o <tmpLastMessagePath> [-m <model>] <prompt>`
-   - Resume: `exec resume <threadID> --json -C … --output-schema … -o …
-     [-m …] <prompt>`
-   - Tier flags (DESIGN §6.5):
-     `.t0Read` → `-s read-only`;
-     `.t1Workspace` → `-s workspace-write`;
-     `.t2Network` → `-s workspace-write -c sandbox_workspace_write.network_access=true`;
-     `.t3Full` → `-s danger-full-access`.
-   - **Forbidden flags** (unit test asserts absence for every tier/turn
-     combination): `--dangerously-bypass-approvals-and-sandbox`,
-     `--ephemeral`, `--skip-git-repo-check`, `--dangerously-bypass-hook-trust`.
-2. Gate: `startTurn` throws `AdapterError.preflightFailed(problems)` when the
-   cached preflight has blocking problems (unsafe binary, unconfirmed path
-   change, not authenticated). `versionUnsupported` is non-blocking (warn).
-3. Temp files: schema is resolved from `Bundle.module` once; `-o` file in a
-   per-turn temp dir (`FileManager.temporaryDirectory/handsfree-turn-<uuid>`),
-   deleted after outcome assembly (best-effort, logged).
-4. Event pipeline: `ProcessRunner.stdoutLines` → `CodexEventDecoder` →
-   forward `.event`s into `RunningTurn.events`; capture the LAST
-   `agent_message` text for the contract parser; on `turn.completed`, assemble
-   `TurnOutcome` with `ResponseContractParser.parse(...)`, thread id, usage.
-5. Failure assembly:
-   - `turn.failed`/stream error item → `.failed(reason)`;
-   - process exit ≠ 0 with no terminal event → `.failed("process exited N: " +
-     stderrTail-derived reason)`;
-   - > 10 consecutive `.malformed` lines → cancel process,
-     `.failed("stream corrupted")`;
-   - cancel() → `.cancelled`; timeout → `.timedOut` (both via 14 semantics).
-   Exit-code semantics are treated as secondary evidence per the research doc;
-   record observed codes in the PR and update the research doc's exit-code
-   note (known unknown #3).
-6. Working directory: `spec.workingDirectory = projectPath`; environment:
-   `LoginEnvironment.capture()` unmodified (DESIGN §9.4).
-7. Integration tests (against FakeCodex, `codexPath` injected): one test per
-   scenario of issue 17 asserting: emitted `AgentEvent` sequence shape,
-   `TurnOutcome`, argv recorded in the invocation log (exact tier flags,
-   resume id, schema/-o paths), temp-file cleanup.
+1. Canonical argv (exhaustively unit-tested; exact arrays for all 8 cases —
+   4 tiers × new/resume — written out in the tests):
+   - New: `exec --json -C <projectPath> <tierFlags…> --output-schema
+     <schemaPath> -o <lastMessagePath> [-m <model>] <prompt>`
+   - Resume: `exec resume <threadID> --json -C <projectPath> <tierFlags…>
+     --output-schema <schemaPath> -o <lastMessagePath> [-m <model>] <prompt>`
+   - `<tierFlags…>`: `.t0Read` → `-s read-only`; `.t1Workspace` →
+     `-s workspace-write`; `.t2Network` → `-s workspace-write -c
+     sandbox_workspace_write.network_access=true`; `.t3Full` →
+     `-s danger-full-access`.
+   - **Forbidden flags** (single `ForbiddenFlags` constant; unit test asserts
+     absence for every case): `--dangerously-bypass-approvals-and-sandbox`,
+     `--dangerously-bypass-hook-trust`, `--ephemeral`,
+     `--skip-git-repo-check`.
+2. Preflight gate: `startTurn` throws `AdapterError.preflightFailed([PreflightProblem])`
+   when the cached preflight has any (blocking) problem; warnings never
+   block.
+3. Environment: `LoginEnvironment.capture()` (already `HANDSFREE_*`-filtered
+   by 14). Test seam: `init(…, extraEnvironment: [String: String] = [:])` —
+   merged ONLY in tests to pass `FAKE_CODEX_SCENARIO/_LOG/_SPEED`; a unit
+   test asserts production construction paths never populate it (grep-able
+   constant + 37 static check).
+4. Wire→domain mapping (from 15's `CodexWireEvent`):
+   `threadStarted→.threadStarted`; `turnStarted→.turnStarted` (+ decoder
+   state reset); `itemCompleted→.item(mapped AgentItem)` — command exit_code
+   nil/0 → `.running`/`.succeeded`, nonzero → `.failed`; `errorItem` maps to
+   `.item(.errorItem)` and is **never terminal** (codex quirk);
+   `.ignored(.unknownEventType(first occurrence))` → one `Log.agent` warning.
+5. Terminal assembly — exactly one `turnEnded(TurnOutcome)`, mapping table:
+   | Condition | TurnStatus | contract |
+   |---|---|---|
+   | wire `turnCompleted` | `.completed` | `ResponseContractParser.parse(lastAgentMessageText, -o file)` result embedded (incl. fallback/ repairs) |
+   | wire `turnFailed(reason)` or `streamError` | `.failed(reason)` | nil |
+   | process exit ≠ 0 with no wire terminal | `.failed("process exited N: <stderr-derived reason>")` | nil |
+   | > 10 consecutive `.malformed` lines OR `droppedLineCount > 0` at a malformed burst | cancel process → `.failed("stream corrupted")` | nil |
+   | `cancel()` invoked | `.cancelled` | nil |
+   | runner `timedOut` | `.timedOut` | nil |
+   Observed real exit codes are recorded in the PR and appended to the
+   research doc's exit-code note (known unknown #3).
+6. Temp files: schema path resolved from `Bundle.module` once; `-o` file in
+   `FileManager.temporaryDirectory/handsfree-turn-<uuid>/`; directory
+   removed after outcome assembly (best-effort, logged).
+7. `RunningTurn.processIdentity` populated from 14's `RunningProcess.identity`.
+8. Integration tests vs FakeCodex (via `extraEnvironment`), one per issue-17
+   scenario, asserting: emitted `AgentEvent` sequence shape, final
+   `TurnOutcome` (status + contract fields + repairs), argv from the
+   invocation log (exact tier flags, resume id, schema/-o paths), temp-dir
+   cleanup, and for the escalation scenarios the full
+   blocked→resume-escalated→completed / blocked→resume-unescalated→blocked
+   matrix.
 
 ## Acceptance Criteria
 
-- [ ] Argv table test covers all 4 tiers × new/resume (8 cases) byte-exact,
-      plus forbidden-flag absence.
-- [ ] All FakeCodex scenarios produce the specified outcomes (happy,
-      needs-input+resume continuity, blocked→escalated-resume completes,
-      blocked→non-escalated repeats, failed, garbage→fallback summary,
-      malformed→corrupted-stream failure, hang→timeout, crash→failed,
+- [ ] Argv table: 8 canonical arrays byte-exact + forbidden-flag absence.
+- [ ] All FakeCodex scenarios produce the mapped outcomes (happy;
+      needs-input + resume continuity; blocked-network/full escalation
+      matrix incl. the network-flag-rejected-for-full case; failed; garbage
+      → `.completed` with `source=.fallback`; malformed → `.failed("stream
+      corrupted")`; hang → `.timedOut`; crash → `.failed(process exited…)`;
       slow-drip full delivery).
-- [ ] Preflight gate blocks dispatch with problems (test with fixture binary).
-- [ ] Cancellation kills the process group and yields `.cancelled` terminal
-      outcome exactly once.
-- [ ] A `live`-tagged smoke (real codex, `-s read-only`, trivial prompt in a
-      scratch git repo) passes on the dev machine; observed exit codes noted.
+- [ ] Preflight gate blocks on problems; warnings don't block (stubbed
+      preflight).
+- [ ] `cancel()` → group killed, single `turnEnded(.cancelled)`.
+- [ ] `CodexExecAdapterLiveTests` (manual): real codex, `-s read-only`,
+      trivial prompt in a scratch git repo; observed exit codes noted +
+      research doc updated.
 
 ## Validation
 
 `swift test --filter CodexExecAdapterTests` (FakeCodex-based, CI-safe);
-`live` smoke output in PR.
+`swift test --filter CodexExecAdapterLiveTests` locally.
 
 ## Dependencies
 
@@ -89,9 +103,10 @@ security bug (threat T7).
 
 ## Non-goals
 
-Approval UX, tier *selection* (orchestrator/approval engine decide; adapter
-only executes the requested tier), multi-turn planning.
+Approval UX/tier selection (21/28 decide; adapter executes the requested
+tier), multi-turn planning, task persistence (26).
 
 ## Design References
 
-DESIGN.md §6.2, §6.5, §9.2 (T7), §12, §16 (#3); ADR-002, ADR-004; research doc.
+DESIGN.md §6.1 (amended), §6.2, §6.5, §9.2 (T7), §12, §16 (#3); ADR-002,
+ADR-004; research doc.

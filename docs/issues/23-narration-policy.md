@@ -5,79 +5,109 @@ NarrationPolicy: verbosity-tiered, throttled progress narration
 ## Summary
 
 Implement `HandsfreeCore/Dialogue/NarrationPolicy`: convert the `AgentEvent`
-stream into (a) throttled spoken narration lines and (b) unthrottled HUD lines,
-per verbosity level.
+stream into (a) throttled spoken narration and (b) unthrottled HUD lines,
+per verbosity level — with forced full narration during escalated turns.
 
 ## Context
 
 DESIGN §5.3 fixes the verbosity table; ADR-008 makes throttling essential
-(every spoken line blocks the mic in half-duplex). Stale-progress dropping is
-shared with the arbiter (11): the policy throttles at *emission*, the arbiter
-drops at *dequeue*.
+(every spoken line blocks the mic). Threat T7 requires escalated (approved
+T2/T3) turns to be fully narrated regardless of the user's verbosity
+setting.
 
 ## Scope
 
-- Policy engine + templates usage + tests. Not: arbiter queueing (11),
-  event production (18).
+- Policy engine + template usage + tests. Not: arbiter queueing (11), event
+  production (18), result/approval/error speech (22/28).
 
 ## Detailed Requirements
 
 1. API:
    ```swift
-   struct NarrationPolicy {
-       init(verbosity: NarrationVerbosity, locale: SpeechLocale, clock: any Clock<Duration>)
-       mutating func ingest(_ event: AgentEvent) -> NarrationOutput
+   public struct TurnNarrationContext: Sendable {
+       public let tier: RiskTier
+       public let isEscalated: Bool          // approved T2/T3 resume turn
    }
-   struct NarrationOutput { let spoken: SpokenUtterance?; let hud: [HUDLine] }
+   public struct NarrationPolicy {
+       public init(verbosity: NarrationVerbosity, locale: SpeechLocale,
+                   templates: PhraseTemplates)      // from 19
+       public mutating func beginTurn(_ context: TurnNarrationContext, at now: Duration)
+       public mutating func ingest(_ event: AgentEvent, at now: Duration) -> NarrationOutput
+   }
+   public struct NarrationOutput {
+       public let spoken: SpokenUtterance?   // priority .narration
+       public let hud: [HUDLine]
+   }
+   public struct HUDLine: Equatable, Sendable { public let icon: HUDIcon; public let text: String }
    ```
-2. HUD lines: EVERY visible event maps to a HUDLine (type icon key + text,
-   sanitized via 20, command text truncated 120 chars) — no throttling.
-3. Spoken rules per verbosity (DESIGN §5.3 table, encode exactly):
-   - `quiet`: nothing from items (dispatch/result/approval/errors are spoken
-     by the FSM layer, not here).
-   - `milestones` (default): first `commandExecution` of the turn; then at
-     most one progress line per 20 s where the LATEST candidate wins
-     (coalescing buffer — emitting happens on the next ingest after the
-     window, no internal timers so the type stays pure); first
-     `fileChange` with count > 0.
-   - `verbose`: every `commandExecution` start, `webSearch`, `todo` — min 5 s
-     spacing, latest-wins coalescing.
-4. Template rendering via phrase dictionaries (19): `narration.command`
-   (`{command}` truncated 60 chars word-boundary), `narration.files`
-   (`{count}`), `narration.web_search`, `narration.started`. Paths spoken as
-   basenames (sanitizer rule, 20).
-5. `reasoning`/`message` items are never narrated (the final message arrives
-   via the contract, not narration). `errorItem` maps to a HUD line only
-   (turn-level failures are FSM-spoken).
-6. Turn lifecycle: `reset()` on turn start (clears first-command flag,
-   coalescing state).
+   Pure value type: time is injected via `now` (no internal clocks); the
+   caller (28) supplies monotonic time.
+2. **Escalation override (T7)**: when `isEscalated == true`, the effective
+   verbosity is `verbose` regardless of configuration. Tests: quiet+escalated
+   and milestones+escalated both narrate every command.
+3. HUD mapping (exhaustive; every `AgentEvent`/`AgentItem` case):
+   | Event/Item | HUD line |
+   |---|---|
+   | `threadStarted`, `turnStarted` | none (state chip covers it) |
+   | `commandExecution(cmd, status)` | icon `terminal`, text = template `narration.command` (`.running`) or `narration.command_done` (`.succeeded`/`.failed` with status suffix) |
+   | `fileChange` | icon `doc`, `narration.files` |
+   | `webSearch` | icon `magnifyingglass`, `narration.web_search` |
+   | `todo` | icon `checklist`, `narration.todo_update` |
+   | `message(text)` | none (final message arrives via the contract) |
+   | `errorItem(message)` | icon `exclamationmark`, sanitized message ≤ 120 |
+   | `unknown(type)` | none (logged upstream) |
+   | `turnEnded` | none (FSM speaks results) |
+   HUD lines are NOT throttled.
+4. Spoken rules (encode DESIGN §5.3 exactly):
+   - `quiet`: no item narration.
+   - `milestones` (default): the first `commandExecution` with status
+     `.running` per turn; thereafter at most one progress line per 20 s
+     window where the LATEST candidate wins (candidate set:
+     `commandExecution(.running)`, `webSearch`, `fileChange`); emission
+     occurs on the first ingest after the window closes; the first
+     `fileChange` with count > 0 is always spoken once.
+   - `verbose`: every `commandExecution(.running)`, `webSearch`, `todo` —
+     min 5 s spacing, latest-wins coalescing.
+   - Pending coalesced narration is DISCARDED at `turnEnded` (results take
+     over; stale progress is noise).
+5. Sanitization: every agent-derived placeholder value (command text, file
+   summary, web query, todo summary, error message) passes
+   `SpeechTextSanitizer.sanitize` (spoken: command 60 chars word-boundary
+   truncation per template; HUD: 120) BEFORE template rendering. Injection
+   tests with SSML/control/URL payloads in command text.
+6. `beginTurn` resets first-command flag, window state, and context.
 
 ## Acceptance Criteria
 
-- [ ] Slow-drip fixture (20 events / 200 ms, via scripted ingestion with
-      TestClock): `milestones` speaks ≤ 2 progress lines + first-command +
-      file-change; `verbose` respects 5 s spacing with latest-wins;
-      `quiet` speaks none.
-- [ ] HUD receives all 20 lines in every mode.
-- [ ] Template rendering: ja and en outputs golden-tested (incl. 60-char
-      truncation at word boundary and basename substitution).
-- [ ] Coalescing: burst of 5 commands in one window → only the last is spoken
-      at window rollover.
-- [ ] Pure value type; no timers, no I/O (compile-time import check).
+- [ ] Scripted timeline tests driving `now` explicitly: milestones speaks
+      first-command + ≤ 1 line per 20 s window (latest wins) + one
+      file-change; verbose respects 5 s spacing; quiet speaks none; a 5-burst
+      of commands in one window yields exactly the last at rollover
+      (exact expected spoken sequences asserted, not just counts).
+- [ ] Escalation override tests (Req 2).
+- [ ] HUD receives every mapped line in all modes; unmapped cases produce
+      none (exhaustive switch test).
+- [ ] Template rendering golden tests ja+en (60-char truncation, basename
+      substitution via sanitizer).
+- [ ] Injection corpus on command/query/error payloads → inert spoken text.
+- [ ] Allowed-imports check: Foundation + HandsfreeAgent + HandsfreeSpeech
+      (SpokenUtterance) only (documented grep in Validation).
 
 ## Validation
 
-`swift test --filter NarrationPolicyTests`.
+`swift test --filter NarrationPolicyTests`;
+`grep -n "^import" Sources/HandsfreeCore/Dialogue/NarrationPolicy.swift`
+output in PR.
 
 ## Dependencies
 
-12, 19, 20.
+10 (SpokenUtterance/SpeechPriority), 12, 19, 20.
 
 ## Non-goals
 
-Result/approval/error speech (FSM/orchestrator), arbiter staleness dropping
+Result/approval/error announcements (FSM/orchestrator), arbiter staleness
 (11), HUD rendering (31).
 
 ## Design References
 
-DESIGN.md §5.3, §4.4; ADR-008.
+DESIGN.md §5.3, §4.4, §9.2 (T7); ADR-008.

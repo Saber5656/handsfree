@@ -4,86 +4,103 @@ Pre-release branding gate: name decision, identifier freeze, publication scan
 
 ## Summary
 
-Execute the pre-release branding checklist: confirm or change the product
-name, freeze the bundle identifier and license, re-verify namespace
-collisions, and run the repository publication-safety scan — the last gate
-before the repo/releases go public.
+Execute the pre-release branding checklist: the human maintainer confirms or
+changes the product name and license, identifiers are frozen and
+consistency-tested, namespace collisions re-verified, and the repository
+publication-safety scan is run — the last gate before the repo/releases go
+public.
 
 ## Context
 
 Naming research (2026-07-08) found the npm/GitHub "handsfree" collision
-(Oz Ramos' archived hand-tracking library) with Homebrew free; the decision
-was deferred to this gate. Repository policy requires a history-wide
-secret/PII scan before any repo is made public. `AppIdentity` (01) and the
-bundle scripts (05/39) were built so a rename is a bounded change.
+(archived hand-tracking library) with Homebrew free; the decision was
+deferred here. Repository policy requires a history-wide secret/PII scan
+before publication. `AppIdentity` (01) keeps a rename bounded. This gate
+runs LAST: it verifies artifacts owned by 01/03/05/35/39 and touches docs
+owned by 40.
 
 ## Scope
 
-- Decision + verification + mechanical rename sweep IF renamed. No feature
-  code.
+- Decision memo + verification + consistency test + scan + repo metadata.
+  Mechanical rename sweep only IF the maintainer chooses rename.
 
 ## Detailed Requirements
 
-1. Re-verify collisions at gate time (record evidence in this issue's PR):
-   `brew search <name>` / cask API, GitHub repo/org search, npm (informational
-   — we ship no npm package), obvious trademark hits (search evidence, not
+1. Collision re-verification at gate time (evidence table in the PR):
+   `brew search <name>` + cask API check, GitHub repo/org search, npm
+   (informational), obvious trademark hits via web search (evidence, not
    legal advice), domain availability (informational).
-2. Present the maintainer a decision memo (in-PR): keep `Handsfree` vs top ≤ 3
-   alternatives with pros/cons (discoverability, collision, ja pronunciation).
-   **The name decision itself is made by the human maintainer** — the issue
-   blocks on their sign-off comment.
-3. On KEEP: freeze `AppIdentity.bundleID = io.github.saber5656.handsfree`;
-   assert consistency across: Info.plist template, make-app.sh, release
-   scripts, log subsystem, notification category, `SupportPaths` (a single
-   test `AppIdentityConsistencyTests` greps rendered artifacts — implement it
-   now either way).
-4. On RENAME: mechanical sweep — `AppIdentity` constants, user-visible strings
-   (`L10n` catalogs), docs (README/DESIGN/ISSUE_PLAN headers), repo
-   rename note + redirect check, support-directory migration decision
-   (document: pre-1.0, no migration code — breaking change acceptable and
-   release-noted).
-5. License confirmation: maintainer confirms MIT (placed in 01) or selects
-   another; SPDX header policy decided (none vs per-file — recommend none +
-   root LICENSE only; record in CONTRIBUTING).
-6. Publication-safety scan (repository policy for going public):
-   - `gitleaks detect --source . --log-opts="--all"` (full history) — run
-     locally; paste summary (tool installed ad hoc, not a repo dependency);
-   - manual grep of history for personal paths/emails beyond the intended
-     author identity (`git log --all -p | grep -iE "<patterns in issue>"`
-     guidance included);
-   - if contamination is found: follow the policy decision tree (scrub via
-     fresh repo vs history rewrite) — escalate to the maintainer, do NOT
+2. Decision memo in the PR: keep `Handsfree` vs ≤ 3 alternatives with
+   pros/cons (discoverability, collision, ja pronunciation). **The name and
+   license decisions are made by the human maintainer — this issue blocks
+   on their explicit sign-off comment.** License: confirm MIT (placed in
+   01) or replace; SPDX policy recorded in CONTRIBUTING (recommend: root
+   LICENSE only, no per-file headers).
+3. `AppIdentityConsistencyTests`
+   (`Tests/HandsfreeCoreTests/AppIdentityConsistencyTests.swift`,
+   implemented regardless of keep/rename) — assertion table:
+   | Artifact | Expected |
+   |---|---|
+   | rendered Info.plist (via `make app SIGN=none` in a fixture step, or direct template substitution in-test) | `CFBundleIdentifier == AppIdentity.bundleID` |
+   | `scripts/make-app.sh` BUNDLE_ID variable | equals `AppIdentity.bundleID` (grep) |
+   | `Log` subsystem constant | equals `AppIdentity.logSubsystem` |
+   | `SupportPaths` directory name | equals `AppIdentity.productName` |
+   | notification category | remains literally `HANDSFREE_TASK` (35's contract; renamed only if 35 is amended) |
+   | release artifact name pattern in `release.sh` | contains `AppIdentity.productName` |
+4. On KEEP: freeze `io.github.saber5656.handsfree`; close DESIGN §16 #8.
+   On RENAME: mechanical sweep — `AppIdentity` constants, UI strings in
+   `Sources/HandsfreeApp/**/*.lproj/Localizable.strings` and the phrase
+   JSONs' user-visible product mentions (explicit path list; `.xcstrings`
+   is forbidden by ADR-006 and must not appear), docs headers
+   (README/DESIGN/ISSUE_PLAN), repo rename + redirect check, support-dir
+   migration decision recorded (pre-1.0: no migration code; release-noted
+   breaking change).
+5. Publication-safety scan (policy for going public; evidence pasted):
+   - `gitleaks detect --source . --log-opts="--all"` over full history
+     (`gitleaks version` recorded; installed ad hoc, not a repo dep);
+   - history grep with the exact pattern set: the maintainer's personal
+     email(s) other than the intended committer identity, `/Users/<name>`
+     absolute home paths, `icloud.com|gmail.com` addresses outside
+     LICENSE/committer fields, plus the issue-04 redactor token patterns —
+     command lines included in the issue for mechanical execution;
+   - contamination found → STOP and escalate to the maintainer with the
+     policy options (fresh-repo migration vs history rewrite); do not
      proceed to publication.
-7. Repo metadata for launch: description, topics
-   (`macos, voice, speech, coding-agent, codex, accessibility`), social
-   preview placeholder, Releases enabled, private-vulnerability-reporting
-   enabled (SECURITY.md dependency from 40).
+6. Repo metadata (exact commands, run after 40's SECURITY.md exists):
+   `gh repo edit <owner>/<repo> --description "Drive coding agents
+   end-to-end with your voice on macOS" --add-topic macos --add-topic voice
+   --add-topic speech --add-topic coding-agent --add-topic codex --add-topic
+   accessibility`; enable private vulnerability reporting (gh API or web —
+   documented step with verification screenshot); Releases enabled; social
+   preview marked maintainer-manual.
 
 ## Acceptance Criteria
 
-- [ ] Collision evidence table dated at gate time committed in the PR.
-- [ ] Maintainer decision recorded (name + license) — explicit human sign-off.
-- [ ] `AppIdentityConsistencyTests` implemented and green.
-- [ ] Publication scan executed with clean result (or escalation documented
-      and resolved before close).
-- [ ] Repo metadata set; DESIGN §16 known-unknown #8 closed.
+- [ ] Collision evidence table dated at gate time.
+- [ ] Maintainer decision recorded (name + license) — explicit human
+      sign-off comment linked.
+- [ ] `AppIdentityConsistencyTests` implemented and green (all table rows).
+- [ ] Publication scan executed; clean result evidence, or documented
+      escalation resolved before close.
+- [ ] Repo metadata set + private vulnerability reporting enabled
+      (verification evidence); DESIGN §16 #8 closed.
 
 ## Validation
 
-Evidence artifacts in the PR (search outputs, scan summary, consistency test
-run); maintainer approval comment.
+Evidence artifacts in the PR (search outputs, gitleaks summary, consistency
+test run, `gh repo view` output); maintainer approval comment.
 
 ## Dependencies
 
-None hard (parallel with wave 5), but MUST complete before the first public
-release/publication of the repository.
+35, 39, 40 (artifact owners verified by the consistency test; docs edited
+here are 40's outputs). Must complete before the first public release.
 
 ## Non-goals
 
-Logo/icon design (tracked separately if desired), trademark registration,
-marketing site.
+Logo/icon design, trademark registration, marketing site, Homebrew cask
+submission (v2).
 
 ## Design References
 
-docs/research/2026-07-08-naming-collision.md; DESIGN.md §16 (#8); ADR-006
-(identifier plumbing); repository publication-safety policy.
+docs/research/2026-07-08-naming-collision.md; DESIGN.md §16 (#8); ADR-006;
+repository publication-safety policy; issues 01/35/39/40 artifacts.

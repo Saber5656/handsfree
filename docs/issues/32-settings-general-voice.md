@@ -4,91 +4,111 @@ Settings window scaffold + General and Voice tabs
 
 ## Summary
 
-Build the Settings window frame (tabbed, SwiftUI) and its first two tabs:
-General (hotkey, language, idle timeout, launch-at-login toggle) and Voice
-(STT locale assets, TTS voice pickers with quality labels + preview, rate,
-verbosity).
+Build the Settings scene (tabbed) and its first two tabs: General (hotkey
+binding via issue 30's recorder, language, idle timeout, launch-at-login
+toggle) and Voice (STT assets, TTS voice pickers + preview, rate,
+verbosity) — all bound live to the ConfigStore through a reusable
+`ConfigBinding` helper.
 
 ## Context
 
-DESIGN §8.3 fixes the tab set. Settings binds directly to the ConfigStore
-(03) — every control is a thin view over config keys, applied live (no
-Save button). The Voice tab is also the recovery surface for the
-compact-voice / missing-asset situations found in research.
+DESIGN §8.3 fixes the tab set. This issue owns the config↔UI binding layer
+(reused by 33) and the hotkey config integration (30 is deliberately
+config-free): it registers the semantic hotkey validator with 03's hook and
+rebinds the `HotkeyManager` on config changes. The menu bar "Settings…" item
+(29) opens this scene.
 
 ## Scope
 
-- Window scaffold + General + Voice tabs. Projects/Policy/Privacy/Agent tabs
-  are issue 33. Diagnostic snapshot button included here (About area).
+- Settings scene + General + Voice tabs + `ConfigBinding` + hotkey config
+  integration + diagnostic-snapshot button. Tabs Projects/Policy/Privacy/
+  Agent are issue 33 (placeholder stubs here).
 
 ## Detailed Requirements
 
-1. Scaffold: standard Settings scene (⌘, from menu bar), tabs: General,
-   Voice, Projects, Policy, Privacy, Agent, About — tabs 3–6 render
-   "placeholder, see issue 33" stubs in this PR. Window 560×420 pt, fixed.
-2. Config binding layer: a small `ConfigBinding<Value>` helper bridging
-   SwiftUI `Binding` ⇄ `ConfigStore.update` (async write-behind, immediate UI
-   echo, error toast on write failure) — reused by 33; unit-tested with the
-   store from 03.
-3. General tab:
-   - Hotkey: `HotkeyRecorderView` (30) + current-binding glyph + reset-to-
-     default; registration errors surface inline.
-   - Language mode: picker `auto / 日本語 / English`
-     (`general.locale_mode`) with caption explaining it affects speech, not UI.
-   - Idle timeout: stepper 10–300 s.
-   - Launch at login: toggle bound to `general.launch_at_login` (the
-     `SMAppService` side-effect is issue 36; until merged the toggle persists
-     config only — note in code).
-4. Voice tab:
-   - STT section per language (ja/en): status line from
-     `STTProvider.availability` (`Installed ✓ / Download required (size) /
-     Unauthorized / Unsupported`), Download button driving `prepare()` with
-     determinate progress (08 `preparationProgress`), error presentation
-     (no-network case).
-   - TTS section per language: voice picker listing `voices(for:)` grouped by
-     quality with labels `Compact/Enhanced/Premium`; a caption when only
-     Compact voices exist: "Better voices can be downloaded in System
-     Settings → Accessibility → Spoken Content" + "Open System Settings"
-     button (`x-apple.systempreferences:com.apple.preference.universalaccess`
-     best-effort URL; fallback: open the Settings app root and show
-     instructions — implement the fallback, macOS URL anchors are brittle).
-   - Preview button per language: speaks a fixed localized sample through the
-     production arbiter (respects half-duplex, priority `.result`).
-   - Rate slider 0.1–1.0 (live preview on release); verbosity picker
-     quiet/milestones/verbose with one-line descriptions.
-5. About area (within scaffold): app version (VERSION resource), macOS
-   version, "Copy diagnostic snapshot" button (04's builder → pasteboard).
-6. All strings via `L10n` (en/ja).
+1. Scaffold: Settings scene (⌘,), tabs General / Voice / Projects / Policy /
+   Privacy / Agent / About; tabs 3–6 render "see issue 33" stubs. Window
+   560×420 pt fixed.
+2. `ConfigBinding<Value>` (file
+   `Sources/HandsfreeApp/Settings/ConfigBinding.swift`):
+   ```swift
+   @MainActor final class ConfigBinding<Value: Equatable>: ObservableObject {
+       init(store: ConfigStore, get: @escaping (Config) -> Value,
+            set: @escaping (inout Config, Value) -> Void)
+       var binding: Binding<Value>       // immediate UI echo
+   }
+   ```
+   Semantics (tested): writes are coalesced (200 ms debounce) into
+   `store.update`; external changes from `store.changes` update the UI
+   unless a local write is pending (local pending wins, then reconciles);
+   store write failure → error toast via an injected `ErrorPresenting` seam
+   and UI reverts to the store value.
+3. Hotkey config integration (owns what 30 deferred):
+   - register `HotkeyValidator` with 03's semantic-validation hook;
+   - General tab embeds `HotkeyRecorderView`; `onCapture` writes the
+     binding via ConfigBinding; a `ConfigStore.changes` observer calls
+     `HotkeyManager.apply` live (no relaunch);
+   - `registrationState == .failed` renders the inline "likely in use"
+     error + reset-to-default button.
+4. General tab: hotkey (above), language mode picker (auto/日本語/English —
+   caption: affects speech, not UI), idle-timeout stepper 10–300 s,
+   launch-at-login toggle bound to config (caption notes the system
+   side-effect lands with issue 36; until then config-only).
+5. Voice tab:
+   - STT per language (ja/en): status from `availability` rendered through a
+     seam (`STTStatusProviding`) so ALL FOUR states are testable
+     (installed / download-required with size / unauthorized / unsupported);
+     Download button drives `prepare()` with determinate progress from
+     `preparationProgress` (08); no-network error presentation. Live
+     screenshots are supplementary evidence, not the AC oracle.
+   - TTS per language: voice picker grouped by quality (labels
+     Compact/Enhanced/Premium); degradation note when the configured id is
+     missing (10's `lastResolutionNote`); compact-only caption + "Open
+     System Settings" button — implement as: try the
+     `x-apple.systempreferences:com.apple.preference.universalaccess` URL,
+     and on failure open System Settings plainly and show step-by-step text
+     (the fallback IS the requirement; anchor URLs are brittle).
+   - Preview buttons per language: speak a fixed localized sample through
+     the production arbiter (priority `.result`, respects half-duplex).
+   - Rate slider 0.1…1.0 (preview on release); verbosity picker with
+     one-line descriptions.
+6. About area: app version (VERSION resource), macOS version, "Copy
+   diagnostic snapshot" — assembles `DiagnosticSnapshotInput` (04) from
+   config JSON + task summary (26) + codex version (13 cache) and copies the
+   redacted output to the pasteboard.
 
 ## Acceptance Criteria
 
-- [ ] `ConfigBinding` round-trip test (UI change → config file change →
-      external change → UI update via `changes` stream).
-- [ ] Voice tab reflects real availability states (manual matrix: ja
-      installed / en not-yet — screenshots) and download progress works
-      (`live` manual).
-- [ ] Missing-voice degradation note appears when configured voice id is
-      absent (10's `lastResolutionNote` surfaced).
-- [ ] Preview audible in ja and en with selected voices (manual).
-- [ ] Diagnostic snapshot lands on the pasteboard, redacted (paste sample in
-      PR with a planted fake token proven masked).
-- [ ] en/ja parity test still green.
+- [ ] `ConfigBinding` tests: debounce, external-change precedence rules,
+      write-failure revert + toast seam.
+- [ ] Hotkey: rebind via recorder takes effect without relaunch (manual) and
+      failure state renders inline (fake registrar test at the VM level).
+- [ ] Voice tab VM tests cover all four STT availability states + download
+      progress + missing-voice note.
+- [ ] Preview audible in ja and en (manual); System-Settings fallback path
+      shows instructions when the anchor URL fails (forced-failure test).
+- [ ] Snapshot lands on the pasteboard redacted (planted fake token masked —
+      paste sample in PR).
+- [ ] General controls each persist to config.json (VM tests +
+      one manual sweep); launch-at-login persists config only (36 note).
+- [ ] en/ja parity test still green; screenshots of both tabs in both
+      languages.
 
 ## Validation
 
-`swift test --filter ConfigBindingTests SettingsModelTests`; manual checklist
-with screenshots (both locales).
+`swift test --filter 'ConfigBindingTests|SettingsGeneralVMTests|SettingsVoiceVMTests'`;
+manual checklist + screenshots.
 
 ## Dependencies
 
-03, 08, 10, 30 (+ 04 for snapshot, 11 for preview path).
+03, 04, 08, 10, 11, 30 (+ scene opened from 29's menu).
 
 ## Non-goals
 
-Projects/Policy/Privacy/Agent tab content (33), theming, import/export of
-settings.
+Projects/Policy/Privacy/Agent tabs (33), `SMAppService` effect (36),
+theming, settings import/export.
 
 ## Design References
 
-DESIGN.md §8.3, §7.2, §13; research doc (voice inventory, settings deep link
-caveat).
+DESIGN.md §8.3, §7.2, §13; research doc (voice inventory; settings deep-link
+caveat); issues 04/08/10/30 APIs.

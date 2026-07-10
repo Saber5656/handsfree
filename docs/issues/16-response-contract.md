@@ -5,88 +5,100 @@ Structured response contract: schema resource, parser, fallback chain
 ## Summary
 
 Implement `HandsfreeAgent/Contract`: the bundled `response-schema.json`
-(DESIGN Appendix C.1), the `AgentResponse` struct, the three-step parsing
-chain of DESIGN §6.3, and field-level validation with caps.
+(DESIGN Appendix C.1), schema-equivalent native validation, the parsing
+chain of DESIGN §6.3, and the fallback summarizer — producing a
+`ParsedResponse` that issue 18 embeds into `TurnOutcome`.
 
 ## Context
 
-This contract is simultaneously the TTS shortening layer (ADR-005) and the
-control-flow signal for needs-input/escalation (DESIGN §6.3). It is a trust
-boundary: agent output is untrusted input (threat T3) and must be validated
-and capped before anything downstream sees it.
+The contract is both the TTS shortening layer (ADR-005) and the control-flow
+signal for needs-input/escalation (§6.3). It is a trust boundary: agent
+output is untrusted (T3). DESIGN §9.5 requires validation equivalent to the
+schema — implemented natively (no third-party JSON-Schema engine, ADR-010).
+Module direction: `HandsfreeAgent` must NOT import `HandsfreeCore`, so this
+issue implements its own code-point-safe truncation; full speech
+sanitization stays at the Core speech boundary (20/28).
 
 ## Scope
 
-- Schema resource, parsing, validation, fallback summarizer. Not: TTS
-  sanitization internals (uses issue 20's `SpeechTextSanitizer` caps), spawn
-  flags (18).
+- Schema resource, `ResponseContractParser`, native validation, fallback
+  reducer, truncation helper. `AgentResponse` struct already exists (12).
 
 ## Detailed Requirements
 
-1. `Resources/response-schema.json` (owned by `HandsfreeAgent` target):
-   byte-for-byte the schema of DESIGN Appendix C.1. A unit test parses the
-   resource and asserts required fields + enum values so DESIGN and resource
-   cannot drift silently.
-2. `AgentResponse` struct (fills the shell from issue 12):
-   `status: ResponseStatus (.ok/.needsInput/.blocked/.failed)`,
-   `voiceSummary: String`, `question: String?`, `blockedReason:
-   BlockedReason? (.needsNetwork/.needsFullAccess/.needsOutOfWorkspace)`,
-   `blockedAction: String?`, `detail: String?`, `proposedNextAction: String?`.
-3. Parsing chain `ResponseContractParser.parse(finalMessageText: String?,
-   lastMessageFile: URL?) -> ParsedResponse`:
-   1. `finalMessageText` (the last `agent_message` item) as JSON.
-   2. Else the `-o` file contents as JSON.
-   3. Else fallback: `ParsedResponse.fallback(summary:…)` — rule-based
-      reduction of raw text: strip fenced code blocks, inline code, markdown
-      links/images (keep link text), URLs, headers/list markers; collapse
-      whitespace; take the first 2 sentences (ja sentence delimiters 。！？
-      and latin .!?) up to 280 chars; `isFallbackSummary=true` (orchestrator
-      prefixes a spoken auto-summary notice, 28).
-   Each step's failure is logged (`Log.agent`) with a reason.
-4. Semantic validation (applied to steps 1–2 results; violation ⇒ fall through
-   to next step):
-   - required: `status` ∈ enum, non-empty `voice_summary`;
-   - `status=needs_input` ⇒ `question` non-empty (else downgrade: treat as
-     `ok`, log);
-   - `status=blocked` ⇒ `blocked_reason` valid AND `blocked_action` non-empty
-     (else treat as `failed` with reason `malformed_blocked` — an
-     unaccountable escalation request must never reach the approval engine);
-   - caps enforced by truncation at code-point boundaries:
-     `voice_summary` 400, `question` 300, `blocked_action` 300, `detail`
-     20 000, `proposed_next_action` 200 (DESIGN §9.5).
-5. JSON Schema validation note: full JSON-Schema evaluation is NOT
-   implemented (no third-party deps); the semantic validation above is the
-   normative gate. Document this in code comments (the schema file's job is
-   to constrain codex's output at generation time).
-6. Determinism: parser is pure; property-based test with random garbage
-   never crashes and always lands in `.fallback`.
+1. `Sources/HandsfreeAgent/Resources/response-schema.json`: canonical schema
+   per DESIGN Appendix C.1. Drift guard: a unit test decodes the resource
+   and asserts — for every property — type, enum values, maxLength, the
+   required list, and `additionalProperties=false`, against constants that
+   the validator itself uses (single source in code; the test proves
+   resource ↔ validator equivalence, superseding "byte-for-byte" wording).
+2. Native validation (`ContractValidator.validate(json: Data) ->
+   Result<AgentResponse, ContractViolation>`): top-level object; no unknown
+   keys; `status` enum; `voice_summary` non-empty string; nullable string
+   types for the rest; `blocked_reason` enum. Length caps applied by
+   truncation (not rejection): `voice_summary` 400, `question` 300,
+   `blocked_action` 300, `detail` 20 000, `proposed_next_action` 200 —
+   code-point-safe (`TruncationHelper`, local to this module, tested with
+   CJK + emoji).
+3. Parsing chain — precise result table (`ParsedResponse`):
+   ```swift
+   public struct ParsedResponse: Sendable {
+       public let response: AgentResponse
+       public let source: Source            // .finalMessage | .lastMessageFile | .fallback
+       public let isFallbackSummary: Bool
+       public let repairs: [Repair]         // .questionMissing | .blockedFieldsInvalid
+   }
+   ```
+   Steps: (1) try `finalMessageText` if non-empty; (2) on ANY
+   `ContractViolation` from step 1, try the `-o` file contents if readable
+   and non-empty; (3) on violation again, fallback reducer over the first
+   available non-empty raw text (finalMessageText, else file contents, else
+   the fixed localizable key `contract.empty_response` handled upstream).
+   **Semantic repairs do NOT fall through** — they apply to an otherwise
+   valid parse and are recorded in `repairs`:
+   - `status=needs_input` with empty/absent `question` → treated as `ok`
+     (repair `.questionMissing`, logged by the adapter);
+   - `status=blocked` with invalid `blocked_reason` OR empty
+     `blocked_action` → treated as `failed(reason: "malformed_blocked")`
+     (repair `.blockedFieldsInvalid`) — an unaccountable escalation request
+     must never reach the approval engine.
+4. Fallback reducer: strip fenced code blocks, inline code, markdown
+   links/images (keep link text), URLs, header/list markers; collapse
+   whitespace; first 2 sentences (ja 。！？ + latin .!?) up to 280 chars;
+   `isFallbackSummary=true`. Deterministic and total (never throws).
+5. Property/fuzz test: ≥ 1000 random and mutated inputs across all three
+   steps never crash and always yield a `ParsedResponse`.
 
 ## Acceptance Criteria
 
-- [ ] Golden tests: valid ok / needs_input / blocked / failed payloads parse
-      to exact structs.
-- [ ] Downgrade rules (needs_input w/o question; blocked w/o action) behave as
-      specified with logged reasons.
-- [ ] Caps: oversize fields truncated at correct lengths (multi-byte safe —
-      test with Japanese + emoji).
-- [ ] Fallback reducer: markdown-heavy 5 KB input → ≤ 280 chars, no code/URLs,
-      sentence-boundary cut (ja and en cases).
-- [ ] Schema resource ↔ DESIGN drift test present.
-- [ ] Fuzz test (≥1000 random/mutated inputs) reaches fallback without throwing.
+- [ ] Golden tests: valid ok / needs_input / blocked / failed → exact
+      structs, `source=.finalMessage`.
+- [ ] Step-2 path: invalid final text + valid `-o` file →
+      `source=.lastMessageFile`.
+- [ ] Repair rules: needs_input-no-question → ok+repair; malformed blocked →
+      failed+repair (both with `source` ≠ `.fallback`).
+- [ ] Caps: oversize fields truncated at exact code-point-safe lengths
+      (multi-byte tests).
+- [ ] Fallback reducer: 5 KB markdown-heavy input → ≤ 280 chars, no
+      code/URLs, sentence-boundary cut (ja and en).
+- [ ] Precedence when both JSON parses fail but both texts exist →
+      fallback uses `finalMessageText` (test); file-only case covered.
+- [ ] Schema↔validator drift test green; fuzz test green.
 
 ## Validation
 
-`swift test --filter ResponseContractTests FallbackSummarizerTests`.
+`swift test --filter 'ResponseContractTests|FallbackSummarizerTests|TruncationHelperTests'`.
 
 ## Dependencies
 
-12, 20 (truncation/sanitizer utilities).
+12.
 
 ## Non-goals
 
-Speech-side sanitization (20 owns stripping for TTS), prompt scaffold (24),
-schema versioning/negotiation with codex (known unknown #4 — revisit on break).
+Speech-side sanitization (20/28 own the TTS boundary), spawn flags (18),
+schema version negotiation (known unknown #4 — revisit on breakage).
 
 ## Design References
 
-DESIGN.md §6.3, Appendix C.1, §9.5, §16 (#4); ADR-005.
+DESIGN.md §6.3 (amended caps note), Appendix C.1, §9.5, §16 (#4); ADR-005,
+ADR-010; DESIGN §3.1 (module direction).

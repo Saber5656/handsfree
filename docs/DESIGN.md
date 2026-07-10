@@ -181,12 +181,17 @@ Sources/
                            # Projects/, Config/, Transcripts/, Logging/, Phrases/
   HandsfreeSpeech/         # Audio/, STT/, VAD/, TTS/, Arbiter/, Earcons/
   HandsfreeAgent/          # Adapter/, Codex/, Contract/, Preflight/
+  HandsfreeTestSupport/    # test-only library: TestClock, mocks (never linked into the app)
+  FakeCodex/               # scripted codex stand-in executable (test/demo)
 Tests/
   HandsfreeCoreTests/  HandsfreeSpeechTests/  HandsfreeAgentTests/
   Fixtures/                # recorded JSONL streams, FakeCodex scripts, phrase cases
-Resources/
-  Info.plist.template  Handsfree.entitlements  response-schema.json
-  phrases/ja.json  phrases/en.json  earcons/*.caf  icon/
+Resources/                 # non-SwiftPM build inputs (consumed by scripts)
+  Info.plist.template  Handsfree.entitlements  icon/
+# SwiftPM target resources live inside their owning target:
+#   Sources/HandsfreeCore/Resources/phrases/{ja,en}.json, scaffolds/*.txt
+#   Sources/HandsfreeAgent/Resources/response-schema.json
+#   Sources/HandsfreeSpeech/Resources/earcons/*.caf
 scripts/
   make-app.sh  sign.sh  notarize.sh  release.sh  fake-codex/
 .github/workflows/ci.yml  release.yml
@@ -219,8 +224,10 @@ public protocol STTProvider: Sendable {
     func availability(locale: Locale) async -> STTAvailability
     // .available | .assetDownloadRequired(size) | .unsupportedLocale | .unauthorized
     func prepare(locale: Locale) async throws     // triggers asset download if needed
-    func startStream(locale: Locale, audio: AsyncStream<AnalyzerBuffer>)
+    func startStream(locale: Locale, audio: AsyncStream<CapturedBuffer>)
         -> AsyncThrowingStream<STTResult, Error>
+    // CapturedBuffer is the capture type defined in §4.1; conversion to the
+    // Speech framework's AnalyzerInput happens inside the Apple provider.
     func stopStream() async
 }
 
@@ -264,7 +271,7 @@ public struct STTResult: Sendable {
 public protocol TTSProvider: Sendable {
     func speak(_ utterance: SpokenUtterance) -> AsyncStream<TTSEvent> // .started, .finished, .cancelled
     func stop()
-    func voices(for locale: Locale) -> [VoiceDescriptor]  // id, name, quality
+    func voices(for locale: Locale) -> [VoiceDescriptor]  // id, name, quality, language
 }
 public struct SpokenUtterance: Sendable {
     public let text: String          // already sanitized (§9.5) and truncated
@@ -356,6 +363,13 @@ Session-end with running task: allowed from any `agent_running` state via
 `end_session` ("バックグラウンドで続けます") — the task detaches to the
 TaskManager (§6.6) and the FSM proceeds to `ending`.
 
+Approval-boundary note: the `awaiting_approval.*` sub-stages mirror the
+ApprovalEngine's progress. Nonce generation, echo verification, retry counting,
+and the approval-internal timeouts (20 s echo / 60 s screen confirm) live in
+the ApprovalEngine (§5.4), which emits stage-change and decision events; the
+session FSM only transitions on those events. The HUD's Approve/Deny clicks
+are routed to the ApprovalEngine, not reduced by the session FSM.
+
 ### 5.2 Intents and phrase matching
 
 Intent set (v1, closed):
@@ -413,8 +427,9 @@ lines are truncated to 60 chars at word boundaries; file paths are spoken as
 - Echo matching: exact digit sequence required; 2 mismatches or 20 s silence →
   denied. Denial is safe: the task stays `awaiting_approval:denied` and can be
   resumed with a different instruction.
-- Tier 3 additionally requires clicking the HUD "Approve" button (mouse/keyboard
-  — deliberately breaking hands-free; configurable off via
+- Tier 3 additionally requires clicking the HUD "Approve" button (pointer
+  click only — the HUD is a non-activating panel and never takes keyboard
+  focus; deliberately breaking hands-free; configurable off via
   `policy.tier3_screen_confirm=false`, which the Settings UI labels as reducing
   protection against voice spoofing).
 - Every approval/denial is written to the transcript store with tier, nonce,
@@ -442,6 +457,7 @@ public struct TurnRequest: Sendable {
 }
 public final class RunningTurn: Sendable {
     public let events: AsyncThrowingStream<AgentEvent, Error>
+    public let processIdentity: ProcessIdentity?  // pid, pgid, start time — for crash recovery (§6.6)
     public func cancel() async                 // SIGINT group, escalate SIGKILL after 5 s
 }
 public enum AgentEvent: Sendable {
@@ -449,10 +465,22 @@ public enum AgentEvent: Sendable {
     case turnStarted
     case item(AgentItem)                       // commandExecution, fileChange, message,
                                                // webSearch, todo, error, unknown(type:String)
-    case turnCompleted(TurnOutcome)            // parsed contract result + usage
-    case turnFailed(reason: String)
+    case turnEnded(TurnOutcome)                // single terminal event, exactly once
+}
+public struct TurnOutcome: Sendable {
+    public let status: TurnStatus              // .completed | .failed(reason) | .cancelled | .timedOut
+    public let contract: AgentResponse?        // parsed per §6.3 (only when .completed)
+    public let rawFinalText: String?
+    public let usage: TurnUsage?
+    public let threadID: String?
 }
 ```
+
+Wire mapping: codex `turn.completed` → `.turnEnded(status: .completed, …)`;
+codex `turn.failed` / stream-level error → `.turnEnded(status: .failed(…))`;
+cancellation and timeout produce `.cancelled` / `.timedOut`. An
+`item.completed` whose item type is `error` is an `AgentItem` and is NOT
+terminal (observed codex quirk — research doc).
 
 Unknown event/item types decode to `.unknown` and are logged, never fatal
 (codex releases frequently; research doc pins this requirement).
@@ -505,6 +533,8 @@ Parsing chain (each step falls through on failure, all failures logged):
 `blocked` semantics: the agent could not perform an action due to sandbox
 limits and stopped at a safe point. `blocked_reason` selects the escalation
 target tier (§6.5); `blocked_action` feeds the approval announcement (§5.4).
+Caps: the contract stores `blocked_action` up to 300 chars; the approval
+announcement additionally truncates it to 120 chars (§5.4).
 
 ### 6.4 Prompt scaffold
 
@@ -652,8 +682,9 @@ model override, max turn seconds), **About**.
 
 ### 8.4 Onboarding (first launch, re-runnable)
 
-1. Welcome + privacy statement (all speech on-device; what leaves the machine:
-   only codex's own traffic under your codex account).
+1. Welcome + privacy statement (all speech processing on-device; what leaves
+   the machine: codex's own traffic under your codex account, plus
+   user-initiated Apple speech-model downloads during setup).
 2. Microphone permission request (+ speech recognition if the API demands it).
 3. STT model check/download for chosen language(s).
 4. TTS voice quality: detect compact-only state, deep-link to System Settings
@@ -668,6 +699,11 @@ model override, max turn seconds), **About**.
 `UNUserNotificationCenter` for background task transitions (§6.6). Actions:
 "Start voice session" (binds task), "Dismiss". Notification text uses the same
 sanitizer as TTS (§9.5); `detail` content never appears in notifications.
+Content policy (T5): completed-task notifications may carry the sanitized
+`voice_summary` (≤120 chars); needs-input and awaiting-approval notifications
+carry only task number, project name, and state — the question/action text is
+disclosed only in-session (speech/HUD) after the user re-engages, never on the
+lock screen.
 
 ---
 
@@ -698,7 +734,7 @@ sanitizer as TTS (§9.5); `detail` content never appears in notifications.
 |---|---|---|
 | T1 | Misrecognition dispatches or approves unintended work | dispatch echo + yes gate (§5.1); nonce digits exact-match, no fuzzing (§5.2); denial-safe defaults; T1 sandbox cap for new tasks (§6.5) |
 | T2 | Third-party voice / played-back audio (TV, meeting) triggers actions | sessions only via local hotkey (R6); random 2-digit nonce per approval, unpredictable to an outsider (§5.4); Tier-3 screen confirm (physical presence proof); approval timeout + retry cap |
-| T3 | Prompt injection via agent output: `voice_summary` tries to social-engineer an approval or fake system speech | approval announcements built ONLY from policy templates + sanitized `blocked_action`; mandatory approval earcon precedes them; TTS sanitizer strips imperatives-to-the-app patterns, control chars, SSML-like markup, URLs (§9.5); summaries are capped at 400 chars |
+| T3 | Prompt injection via agent output: `voice_summary` tries to social-engineer an approval or fake system speech | approval announcements built ONLY from policy templates + sanitized `blocked_action` (≤120 chars); mandatory approval earcon precedes them; TTS sanitizer strips control chars, markup/SSML-like tags, and URLs (§9.5); summaries are capped at 400 chars. Note: keyword-based "imperative content" filtering is deliberately NOT relied on — the effective defenses are the unpredictable nonce, template-only announcements, and the earcon |
 | T4 | Malicious project repo content attacks the app | app never executes/parses repo content itself (no shell, no eval); only codex touches the tree inside its sandbox; paths validated (§7.1) |
 | T5 | Transcript/notification leakage of sensitive code or secrets | transcripts 0600, retention sweep, opt-out (§7.3); notifications carry summaries only (§8.5); raw audio never stored (§4.1) |
 | T6 | `codex_path` / binary hijack, PATH confusion | absolute-path pin after first resolution, stored in config; warn + require Settings confirmation when the resolved binary path changes; refuse world-writable binary paths (§6.2) |
@@ -749,7 +785,7 @@ model. Revisit for MAS distribution (v2+, non-goal).
 | Config file | Codable + schema version; path fields must be absolute, exist, and be user-owned; numeric ranges clamped |
 | Phrase dictionaries (bundled) | schema-validated at build time by a unit test |
 | STT text | treated as untrusted free text; only ever matched against dictionaries or wrapped in prompt scaffold (never interpolated into shell) |
-| Process spawning | argv arrays only, never `sh -c`; project path passed via `-C`; no user text in flags |
+| Process spawning | argv arrays only, never `sh -c`; project path passed via `-C`; no user text in flags. One documented exception: a once-per-run login-environment capture executes the user's own `$SHELL` (validated absolute path) with a fixed literal command string (`-l -c 'command -v codex'` / `-l -c env`) and no interpolated input; the captured environment is in-memory only, never logged or persisted, and `HANDSFREE_*`-prefixed variables are stripped before any spawn |
 
 ### 9.6 Secure defaults summary
 
@@ -765,6 +801,9 @@ retention · no telemetry · no auto-update · no third-party code at runtime.
   (assemble `Handsfree.app`: binary, `Info.plist` from template with
   `NSMicrophoneUsageDescription`, `NSSpeechRecognitionUsageDescription`,
   `LSUIElement`, version stamping; resources; `.icns` via `iconutil`).
+  `make app` ad-hoc signs the bundle by default so local TCC identity stays
+  stable across rebuilds; `make app SIGN=none` (used by CI) skips signing.
+  Developer ID signing is exclusively `make sign` (§ release pipeline).
 - `make sign` (`codesign --options runtime` + entitlements),
   `make notarize` (`notarytool submit --wait` + `stapler staple`),
   `make release` (zip, checksums). All CLT-only — verified on the dev machine
@@ -904,7 +943,7 @@ App : "Ending session." ♪end
   "version": 1,
   "locale": "ja-JP",
   "intents": {
-    "yes":            ["はい", "うん", "おけ", "オッケー", "了解", "お願い"],
+    "yes":            ["はい", "うん", "おけ", "オッケー", "了解"],
     "no":             ["いいえ", "いや", "だめ"],
     "deny":           ["拒否", "やめて", "中止"],
     "cancel_current": ["ストップ", "キャンセル", "止めて"],
@@ -933,7 +972,9 @@ App : "Ending session." ♪end
 Matcher contract: normalization NFKC → lowercase → trim fillers
 (「えっと」"um" list per locale) → exact table match → bounded fuzzy for
 intents (edit distance ≤ 1 per 4 chars) → **digits & approve keyword: exact
-only**.
+only**. Politeness-token stripping applies only to free-text command
+extraction, never before exact alias lookup (so a bare politeness word cannot
+be consumed into an unintended `yes`).
 
 ## Appendix C — Machine contracts
 
@@ -964,11 +1005,13 @@ only**.
 {
   "version": 1,
   "general": { "locale_mode": "auto|ja|en", "hotkey": {"key":"Space","modifiers":["control","option"]},
-               "idle_timeout_sec": 30, "launch_at_login": false },
+               "idle_timeout_sec": 30, "launch_at_login": false,
+               "onboarding_completed": false },
   "voice":   { "stt_provider": "apple", "tts_provider": "apple",
                "tts_voice_ja": null, "tts_voice_en": null,
                "speaking_rate": 0.5, "narration_verbosity": "quiet|milestones|verbose" },
-  "agent":   { "kind": "codex", "codex_path": null, "model": null,
+  "agent":   { "kind": "codex", "codex_path": null,
+               "codex_path_confirmed_path": null, "model": null,
                "max_turn_seconds": 1800, "max_concurrent_tasks": 3 },
   "policy":  { "allow_tier3": true, "tier3_screen_confirm": true },
   "privacy": { "store_transcripts": true, "transcript_retention_days": 30 },

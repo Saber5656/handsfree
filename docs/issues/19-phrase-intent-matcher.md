@@ -4,81 +4,94 @@ Phrase dictionaries (ja/en) and IntentMatcher
 
 ## Summary
 
-Author the complete v1 phrase dictionaries (`Resources/phrases/ja.json`,
-`en.json`) including all narration/approval/announcement templates, and
-implement the `IntentMatcher` pipeline that turns finalized STT text into
-intents under a context-provided active-intent set.
+Author the complete v1 phrase dictionaries
+(`Sources/HandsfreeCore/Resources/phrases/{ja,en}.json`) including every
+template key, and implement the `IntentMatcher` pipeline that turns finalized
+STT text into intents under a context-provided active-intent set.
 
 ## Context
 
-R9 mandates dictionary-driven bilingual phrases: adding a locale or synonym
-must be data-only. Matching rules are security-relevant (DESIGN §5.2): nonce
-digits and the approve keyword match exactly, everything else may fuzz within
-bounds. The intent taxonomy is fixed in DESIGN §5.2.
+R9 mandates dictionary-driven bilingual phrases. Matching rules are
+security-relevant (DESIGN §5.2/Appendix B): nonce digits and the approve
+keyword match exactly; ja digit vocabulary excludes homophones (7=なな,
+never しち). Politeness stripping applies only to free-text extraction,
+never before exact alias lookup (DESIGN Appendix B, amended).
 
 ## Scope
 
-- Dictionary JSONs (complete — including the template set DESIGN Appendix B
-  marks as "full set enumerated in the phrase-table issue"), schema, matcher,
-  tests. Not: FSM consumption (22), approval flow (21).
+- Dictionary JSONs, schema struct, matcher, tests. Not: FSM consumption
+  (22), approval flow (21), project resolution logic (25 — but the
+  project-error template keys ARE defined here).
 
 ## Detailed Requirements
 
-1. Dictionary schema exactly per DESIGN Appendix B (`version`, `locale`,
-   `intents`, `prefixes`, `digits`, `approve_keyword`, `templates`) plus
-   `fillers` (list of leading/trailing filler tokens: ja 「えっと」「あの」
-   「うーん」; en "um", "uh", "okay so") and `sentence_prefix_politeness`
-   (tokens strippable anywhere: ja 「お願い」「ください」 — used only for
-   command intents, never free text).
-2. Template keys (complete set; both locales must define every key — parity
-   test): `narration.command`, `narration.command_done`, `narration.files`,
-   `narration.web_search`, `narration.started`, `announce.session_start`,
-   `announce.session_end`, `announce.dispatch_confirm`, `announce.dispatched`,
-   `announce.result_ok`, `announce.result_failed`, `announce.result_cancelled`,
+1. Dictionary schema per DESIGN Appendix B: `version`, `locale`, `intents`,
+   `prefixes`, `digits`, `approve_keyword`, `templates`, plus `fillers`
+   (ja: えっと/あの/うーん; en: um/uh/"okay so") and `politeness` tokens
+   (ja: お願い/ください; en: please) — politeness applies ONLY to free-text
+   command extraction (Req 4e), never to exact alias lookup.
+2. Template keys (complete closed set; both locales define every key —
+   parity test): `narration.command`, `narration.command_done`,
+   `narration.files`, `narration.web_search`, `narration.todo_update`,
+   `narration.started`, `announce.session_start`, `announce.session_end`,
+   `announce.dispatch_confirm`, `announce.dispatched`, `announce.result_ok`,
+   `announce.result_failed`, `announce.result_cancelled`,
    `announce.needs_input_prefix`, `announce.fallback_summary_notice`,
    `announce.continue_prompt`, `announce.task_pending_single`,
    `announce.task_pending_multi`, `announce.task_completed_bg`,
-   `approval.announce`, `approval.approved`, `approval.denied`,
-   `approval.timeout`, `approval.retry`, `error.not_understood`,
+   `announce.bg_continue`, `approval.announce`, `approval.approved`,
+   `approval.denied`, `approval.timeout`, `approval.retry`,
+   `approval.tier3_disabled`, `error.not_understood`,
    `error.stt_unavailable`, `error.agent_preflight`, `error.spawn_failed`,
-   `error.turn_timeout`, `help.text`. Placeholders use `{name}` syntax;
-   a render function substitutes and refuses unknown placeholders (test).
+   `error.turn_timeout`, `error.project_not_found`,
+   `error.project_invalid_path`, `error.project_not_git`,
+   `error.project_ambiguous`, `error.registry_empty`,
+   `error.too_many_tasks`, `error.quitting_drain`, `contract.empty_response`,
+   `help.text`. Placeholders `{name}`; the render function rejects unknown
+   placeholders (typed error, tested).
 3. `IntentMatcher.match(text: String, context: MatchContext) -> MatchResult`
-   where `MatchContext` carries: active intent set (from FSM state), locale,
-   whether a task-selection list is offered, known project names (from 25).
+   with `MatchContext { active: Set<IntentKind>, locale: SpeechLocale,
+   selectionOffered: Bool, knownProjectNames: [String] }` —
+   `knownProjectNames` is a plain string list (no ProjectRegistry
+   dependency; 25 supplies it at runtime).
    `MatchResult = .intent(Intent) | .freeText(String) | .noMatch`.
-4. Pipeline (DESIGN §5.2, in order): NFKC normalize → lowercase (locale-aware)
-   → strip punctuation `。、．，!?！？.,;:「」()（）` → strip fillers →
-   (a) digits/approve: exact-only match when `approve_echo` is active —
-   pattern `approve_keyword d1 d2` with digits from the digit table, spaces
-   optional; (b) exact intent lookup; (c) prefix intents
-   (`switch_project`, `task_select`) — prefix + remainder resolved (project
-   names matched here with the same normalizer; numbers parse from digit
-   table words AND arabic numerals); (d) bounded fuzzy for command intents:
-   Levenshtein ≤ ⌊len/4⌋, ties → longest alias wins; (e) free text (only if
-   the context allows `new_task`/`follow_up`/`answer`), else `.noMatch`.
-5. Guarantees: matching is pure, < 10 ms for 200-char input (perf test);
-   `approve_echo` can NEVER result from fuzzy or partial input (adversarial
-   tests: 「承認 4」, 「承認 よん きゅう じゃなくて」, "confirm 4 9 maybe" →
-   `.noMatch`/free-text depending on context; trailing extra tokens invalidate
-   an echo).
-6. Build-time schema validation: a unit test decodes both dictionaries against
-   the schema struct and asserts template-key parity + digit-table
-   completeness (0–9) + non-empty alias lists.
+4. Pipeline (in order):
+   a. NFKC normalize → locale-aware lowercase → strip punctuation
+      `。、．，!?！？.,;:「」()（）` → strip leading/trailing fillers.
+   b. If `approve_echo` is active: exact-only pattern
+      `approve_keyword d1 d2` (digits from the digit table, arabic numerals
+      also accepted, spaces optional). ANY extra tokens ⇒ not an echo. No
+      fuzzing, ever.
+   c. Exact intent alias lookup (politeness NOT stripped yet).
+   d. Prefix intents (`switch_project`, `task_select`): prefix + remainder;
+      project names matched against `knownProjectNames` with the same
+      normalizer; task numbers parse from digit words AND numerals.
+   e. Bounded fuzzy for command intents only: Levenshtein ≤ ⌊len/4⌋; ties →
+      longest alias wins. Politeness tokens are stripped before this step
+      and before free-text fallthrough.
+   f. Free text (only if context allows `new_task`/`follow_up`/`answer`),
+      else `.noMatch`.
+5. Guarantees: pure; < 10 ms for 200-char input (perf test); ja digit table
+   MUST NOT contain しち (schema test); a resource-load unit test opens both
+   dictionaries via `Bundle.module` (assembled-app smoke stays with 05/38).
 
 ## Acceptance Criteria
 
-- [ ] Golden corpus ≥ 60 cases per locale covering every intent, fillers,
-      politeness, fuzzy hits, fuzzy-too-far misses, digits (word + numeral),
-      code-switched project names (ja utterance with ASCII project name).
-- [ ] Adversarial echo suite (≥ 10 cases/locale) proves exact-only nonce rules.
-- [ ] Template parity + render tests (unknown placeholder → error).
-- [ ] Matcher perf test < 10 ms (DESIGN §15).
-- [ ] Dictionaries load from `Bundle.module` in the assembled app (05 smoke).
+- [ ] Golden corpus ≥ 60 cases/locale: every intent, fillers, politeness
+      (incl. bare 「お願い」 in confirming context → NOT `yes`), fuzzy
+      hits/misses, digits (word + numeral), code-switched project names.
+- [ ] Adversarial echo suite ≥ 12 cases/locale: 「承認 4」, digits reversed,
+      「承認 しち きゅう」 (must fail), extra-token suffixes, fuzzy-distance
+      keyword variants — all rejected.
+- [ ] Template parity + render tests (unknown placeholder → error; every key
+      of Req 2 present in both locales).
+- [ ] Digit-table schema tests (0–9 complete; しち absent).
+- [ ] Matcher perf < 10 ms (DESIGN §15).
+- [ ] `Bundle.module` load test green.
 
 ## Validation
 
-`swift test --filter IntentMatcherTests PhraseDictionaryTests`.
+`swift test --filter 'IntentMatcherTests|PhraseDictionaryTests'`.
 
 ## Dependencies
 
@@ -86,9 +99,9 @@ bounds. The intent taxonomy is fixed in DESIGN §5.2.
 
 ## Non-goals
 
-Wake word phrases, per-user custom phrases (v2), UI strings localization
-(issue 29/32 `.strings` files — distinct from these spoken-phrase tables).
+Wake word, per-user custom phrases (v2), UI `.strings` localization (29/32),
+who calls the matcher (22/28).
 
 ## Design References
 
-DESIGN.md §5.2, §5.3, Appendix B, §9.2 (T1), §15; R9.
+DESIGN.md §5.2, §5.3, Appendix B (amended), §9.2 (T1), §15; R9.

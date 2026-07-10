@@ -4,80 +4,111 @@ Global hotkey manager and shortcut recorder control
 
 ## Summary
 
-Implement `HandsfreeApp/HotkeyManager` on Carbon `RegisterEventHotKey`
-(no Accessibility permission) with a config-driven binding, plus the SwiftUI
-recorder control used by Settings, and the key/modifier mapping table shared
-with config validation (03).
+Implement the standalone hotkey component in `HandsfreeApp`: the `KeyMap`
+table, `HotkeyBinding` model + validator, a Carbon `RegisterEventHotKey`
+manager (no Accessibility permission), and the SwiftUI recorder control —
+all consumable by 29 (boot registration) and 32 (Settings integration).
 
 ## Context
 
 R6 makes the hotkey the sole session trigger; DESIGN §9.3 commits to zero
-Accessibility permission, which rules out CGEventTap/NSEvent global monitors
-for activation. Default is ⌃⌥Space with a known collision risk (input-source
-switching — known unknown #5), so rebinding must be first-class.
+Accessibility permission, ruling out CGEventTap/global NSEvent monitors.
+Default ⌃⌥Space has a known collision risk (input sources — known unknown
+#5). This issue is deliberately config-free: 32 wires it to the ConfigStore,
+29 wires boot registration and error surfacing.
 
 ## Scope
 
-- HotkeyManager, KeyMap table, RecorderView. Not: what the hotkey does (29/28
-  route it), Settings tab assembly (32).
+- `KeyMap`, `HotkeyBinding`, `HotkeyValidator`, `HotkeyManager`,
+  `HotkeyRecorderView`. Not: config integration (32), boot/menu surfacing
+  (29).
 
 ## Detailed Requirements
 
-1. `KeyMap`: bidirectional table `String ⇄ (carbonKeyCode, displayGlyph)` for
-   keys: letters A–Z, digits, F1–F12, Space, Return, Escape, arrows;
-   modifiers `control/option/command/shift ⇄ carbon flags ⇄ ⌃⌥⌘⇧`. Exposed to
-   HandsfreeCore config validation via a protocol-registered validator
-   (03's hotkey validation upgrades from shape-only to table-backed in this
-   PR — update 03's stub).
+1. Model + table:
+   ```swift
+   public struct HotkeyBinding: Codable, Equatable, Sendable {
+       public let key: String            // canonical names: "A"…"Z", "0"…"9",
+                                         // "F1"…"F12", "Space", "Return", "Escape",
+                                         // "Up","Down","Left","Right"
+       public let modifiers: [String]    // canonical order: control, option, command, shift
+   }
+   public enum KeyMap {
+       static func carbonKeyCode(for key: String) -> UInt32?
+       static func carbonModifiers(for mods: [String]) -> UInt32?
+       static func displayGlyphs(_ b: HotkeyBinding) -> String   // "⌃⌥Space"
+   }
+   public enum HotkeyValidationError: Error, Equatable {
+       case unknownKey(String), unknownModifier(String)
+       case noModifier                    // ≥1 of ⌃⌥⌘ required (⇧ alone insufficient)
+       case duplicateModifiers
+   }
+   public enum HotkeyValidator { static func validate(_ b: HotkeyBinding)
+       -> HotkeyValidationError? }        // also canonicalizes order/case
+   ```
+   Default binding constant `HotkeyBinding(key: "Space",
+   modifiers: ["control","option"])` exported for 03's defaults; a doc note
+   records the ⌃⌥⌘Space fallback recommendation for input-source-switching
+   users (known unknown #5).
 2. `HotkeyManager`:
    ```swift
-   func register(_ binding: HotkeyBinding) throws   // unregisters previous
-   func unregister()
-   var pressed: AsyncStream<Void>
+   public protocol HotkeyRegistrar {      // seam: production = Carbon
+       func register(keyCode: UInt32, modifiers: UInt32,
+                     handler: @escaping () -> Void) throws -> HotkeyToken
+       func unregister(_ t: HotkeyToken)
+   }
+   public final class HotkeyManager {
+       public init(registrar: any HotkeyRegistrar = CarbonHotkeyRegistrar())
+       public func apply(_ binding: HotkeyBinding) throws   // validates, unregisters old, registers new
+       public func unregister()
+       public var pressed: AsyncStream<Void>
+       public private(set) var registrationState: RegistrationState
+           // .unregistered | .registered(HotkeyBinding) | .failed(HotkeyBinding, osStatus: Int32)
+   }
    ```
-   - Carbon `RegisterEventHotKey` + `InstallEventHandler`; errors map to
-     `HotkeyError.registrationFailed(osStatus)` — surfaced by Settings as
-     "conflict likely, choose another" (best-effort; macOS doesn't report the
-     owner).
-   - Reacts to config changes (03 `changes` stream) — rebind live.
-   - At least one modifier required (bare keys rejected in KeyMap validation;
-     Space requires ≥ 1 of ⌃⌥⌘).
-3. `HotkeyRecorderView` (SwiftUI): click-to-arm, captures the next local
-   keyDown via `NSEvent.addLocalMonitor` (local only — no permissions),
-   renders glyph string (⌃⌥Space), Esc cancels arming, invalid combos show
-   the KeyMap error inline. Writes to config only on valid capture.
-4. Default binding constant `⌃⌥Space` lives in the config defaults (03) and
-   a doc note records the fallback recommendation (⌃⌥⌘Space) for JIS
-   input-source users (known unknown #5).
-5. Register at app boot AFTER config load; failure at boot → menu bar error
-   badge + Settings hint, app still usable via menu (DESIGN §12 resilience).
+   Carbon path: `RegisterEventHotKey` + `InstallEventHandler`; failure maps
+   to `.failed` with the OSStatus (macOS does not report the conflicting
+   owner — callers phrase it as "likely in use; choose another").
+3. `HotkeyRecorderView` (SwiftUI, self-contained): click-to-arm; captures
+   the next keyDown via a LOCAL `NSEvent.addLocalMonitorForEvents` (no
+   permissions); Esc cancels arming; renders `displayGlyphs`; invalid
+   captures show the `HotkeyValidationError` message inline; emits the valid
+   binding via a callback (`onCapture: (HotkeyBinding) -> Void`) — it does
+   NOT write config itself.
+4. Automated tests use a `FakeHotkeyRegistrar` (records register/unregister,
+   injectable failure, synthesizable presses): apply/re-apply/unregister
+   lifecycle, `pressed` delivery, failure state, validator table
+   (round-trip every key/modifier; invalid names; modifier canonicalization;
+   no-modifier and Space-without-modifier rejection).
+5. Real-Carbon verification is a manual item executed in issue 29's launch
+   checklist (frontmost-app matrix + no-Accessibility proof) — noted here,
+   owned there.
 
 ## Acceptance Criteria
 
-- [ ] KeyMap round-trip tests (string→code→string) for every entry; invalid
-      strings rejected.
-- [ ] Manual: default hotkey toggles a test log line with the assembled app in
-      any frontmost app (TextEdit, Finder) — WITHOUT Accessibility permission
-      granted (verify in System Settings that Handsfree is absent from the
-      Accessibility list; screenshot in PR).
-- [ ] Rebind via recorder updates config and takes effect without relaunch.
-- [ ] Registration failure path (attempt binding ⌘Space while Spotlight owns
-      it — or a second in-process registration) shows the typed error.
-- [ ] `pressed` stream delivers on MainActor-independent context (test with a
-      posted Carbon event if feasible; else covered by manual checklist).
+- [ ] KeyMap round-trip tests for every table entry; glyph rendering test.
+- [ ] Validator: all four error cases + canonicalization tested.
+- [ ] Manager lifecycle with the fake registrar: apply→re-apply unregisters
+      the old token; failure → `.failed` with status; `pressed` fires on
+      synthesized events.
+- [ ] Recorder: arming, Esc cancel, invalid-combo inline error, callback
+      payload (ViewInspector-free logic tests via an extracted
+      `RecorderModel`).
+- [ ] No Accessibility-requiring API anywhere in the component (grep for
+      `CGEventTap`/`addGlobalMonitor` → nothing).
 
 ## Validation
 
-`swift test --filter KeyMapTests`; manual checklist (frontmost-app matrix,
-no-accessibility proof) in the PR.
+`swift test --filter 'KeyMapTests|HotkeyValidatorTests|HotkeyManagerTests|RecorderModelTests'`.
 
 ## Dependencies
 
-01, 03 (validator upgrade touchpoint).
+01.
 
 ## Non-goals
 
-Hold-to-talk mode, multiple bindings, media-key support, wake word.
+Hold-to-talk, multiple bindings, media keys, wake word, config persistence
+(32), boot wiring (29).
 
 ## Design References
 

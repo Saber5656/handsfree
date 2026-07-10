@@ -4,66 +4,76 @@ CI workflow: build, test, lint on macos-26 with SHA-pinned actions
 
 ## Summary
 
-Add `.github/workflows/ci.yml` running build + tests + lint + resource-schema
-checks on every PR and push to `main`, on GitHub-hosted `macos-26` runners.
+Add `.github/workflows/ci.yml` running build + tests + lint + an unsigned
+`.app` assembly smoke on every PR and push to `main`, on GitHub-hosted
+`macos-26` runners, and establish the repository's live-test naming
+convention.
 
 ## Context
 
-macos-26 arm64 runners are GA since 2026-02-26 (research doc
-2026-07-08-macos-speech-and-toolchain.md). CI must exclude tests that need a
-microphone, downloaded speech assets, or a logged-in codex CLI; those are
-tagged and run manually (DESIGN §11). Supply-chain rules require SHA-pinned
-actions (DESIGN §9.2 T8).
+macos-26 arm64 runners are GA since 2026-02-26 (research doc). CI must exclude
+tests that need a microphone, downloaded speech assets, or a logged-in codex
+CLI (DESIGN §11). Supply-chain rules require SHA-pinned actions (DESIGN §9.2
+T8). DESIGN §10 requires the CI to include the `make app` smoke, so this
+issue depends on issue 05.
 
 ## Scope
 
-- One workflow file `ci.yml` + a `Tests/README.md` note about test tags.
-- Release workflow is issue 39. No caching optimizations beyond SwiftPM cache.
+- `ci.yml`, `Tests/README.md` (test-convention doc), one permanent
+  live-convention fixture test. Release workflow is issue 39.
 
 ## Detailed Requirements
 
-1. Triggers: `pull_request` (all branches), `push` to `main`. Concurrency
-   group `ci-${{ github.ref }}` with `cancel-in-progress: true`.
-2. Single job `build-test`, `runs-on: macos-26`, `timeout-minutes: 30`:
-   - `actions/checkout` pinned to a full commit SHA (comment records the tag).
+1. **Live-test convention** (used by every later issue; documented in
+   `Tests/README.md`): test suites that require hardware, speech assets,
+   network, or a real codex login are placed in suites whose type name ends
+   in `LiveTests`. CI excludes them with `swift test --skip 'LiveTests$'`;
+   locally they run with `swift test --filter 'LiveTests$'` (or a narrower
+   filter). Rationale: SwiftPM's `--filter/--skip` take a single regex over
+   test identifiers; there is no stable tag-based CLI filter on the pinned
+   toolchain.
+2. Permanent fixture: `Tests/HandsfreeCoreTests/LiveConventionLiveTests.swift`
+   containing one trivially-passing test. It proves the skip mechanism in CI
+   logs (skipped there, runs locally) and stays in the repo as the
+   convention's canary.
+3. Triggers: `pull_request` (all branches), `push` to `main`. Concurrency
+   group `ci-${{ github.ref }}`, `cancel-in-progress: true`.
+4. Single job `build-test`, `runs-on: macos-26`, `timeout-minutes: 30`,
+   workflow-level `permissions: contents: read`, no secrets:
+   - `actions/checkout` and `actions/cache` pinned to full 40-char commit
+     SHAs with version comments.
    - Print toolchain: `sw_vers && swift --version`.
-   - Cache `.build` keyed on `Package.swift` + sources hash
-     (`actions/cache` pinned by SHA).
+   - Cache `.build` keyed on hash of `Package.swift` + `Sources/**`.
    - `swift build -c debug`.
-   - `swift test --skip-tag live` — tests requiring hardware/network/codex are
-     tagged `live` (swift-testing `.tags(.live)`, tag defined in issue 01's
-     test support or first use here).
+   - `swift test --skip 'LiveTests$'` (as issues land, phrase/schema/contract
+     validation tests run here automatically — no separate step needed).
    - `make lint`.
-3. `permissions: contents: read` at workflow top level (least privilege).
-4. No secrets referenced anywhere in this workflow.
-5. Badge: add CI status badge markdown snippet to the PR description for later
-   README use (README itself is issue 40).
-6. Document in `Tests/README.md`: tag taxonomy (`live` = requires mic, speech
-   assets, or real codex; excluded in CI), how to run them locally
-   (`swift test --filter-tag live`).
+   - `make app SIGN=none` (unsigned assembly smoke per DESIGN §10) followed by
+     `test -x dist/Handsfree.app/Contents/MacOS/Handsfree`.
 
 ## Acceptance Criteria
 
-- [ ] CI passes on the PR introducing it (green run linked in the PR).
-- [ ] Every `uses:` is pinned to a 40-char commit SHA with a version comment.
-- [ ] Workflow has `permissions: contents: read` and no secret usage.
-- [ ] A deliberately `live`-tagged dummy test is skipped in CI (visible in logs)
-      and runs locally.
+- [ ] CI green on the PR introducing it (run linked in the PR).
+- [ ] Every `uses:` is pinned to a 40-char SHA with a version comment.
+- [ ] `permissions: contents: read` at workflow level; no secret references.
+- [ ] CI log shows `LiveConventionLiveTests` skipped; the same suite passes
+      locally with `swift test --filter 'LiveTests$'` (both shown in PR).
+- [ ] `make app SIGN=none` step passes in CI.
 
 ## Validation
 
-- Push a scratch commit with (a) a failing unit test → CI red; (b) revert →
-  green. Link both runs in the PR.
-- `actionlint` (run via `brew install actionlint` locally, not added to repo
-  deps) reports no errors — paste output into the PR.
+- Scratch commits demonstrating (a) failing unit test → red, (b) revert →
+  green; both runs linked in the PR.
+- `actionlint` run locally (not a repo dependency); output pasted in the PR.
 
 ## Dependencies
 
-01.
+01, 05.
 
 ## Non-goals
 
-Release/signing workflow (39), coverage upload, matrix builds, Linux.
+Release/signing workflow (39), coverage upload, matrix builds, README badge
+(issue 40 owns README content).
 
 ## Design References
 

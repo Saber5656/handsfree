@@ -1,75 +1,98 @@
 # Title
 
-TranscriptStore: session JSONL records, task index, retention sweep
+TranscriptStore: session JSONL records, task index primitives, retention
 
 ## Summary
 
-Implement `HandsfreeCore/Transcripts/TranscriptStore`: append-only per-session
-JSONL files and the `tasks.json` index, with strict permissions, redaction,
-retention enforcement, and the privacy switches of DESIGN §7.3.
+Implement `HandsfreeCore/Transcripts/TranscriptStore`: append-only
+per-session JSONL with comprehensive redaction, the atomic `tasks.json`
+index primitives consumed by 26, retention enforcement, and the privacy
+switches of DESIGN §7.3.
 
 ## Context
 
-Transcripts are the audit trail for approvals (threat T7 evidence) and the
-recovery source for tasks (26) — but also the biggest privacy liability
-(threat T5). Retention and opt-out must be real, not cosmetic.
+Transcripts are the audit trail for approvals (T7 evidence) and the recovery
+source for tasks — and the biggest privacy liability (T5). Every untrusted
+string is redacted at persist time; opt-outs must be real.
 
 ## Scope
 
-- Store, record schema, sweep, delete-all. Not: what gets recorded when
-  (callers), Settings UI (33).
+- Store actor, record schema, index primitives, sweep, delete APIs. Not:
+  what/when to record (28 calls it), Settings UI (33).
 
 ## Detailed Requirements
 
-1. Layout (DESIGN §7.3):
-   `<AppSupport>/Handsfree/transcripts/YYYY/MM/<session-id>.jsonl` and
-   `<AppSupport>/Handsfree/tasks.json`. Dirs `0700`, files `0600`
-   (same `SupportPaths` as 03). Session id: `<yyyyMMdd-HHmmss>-<4 random hex>`.
-2. Record envelope: `{"ts": ISO8601-millis, "type": String, "v": 1, …payload}`.
-   Types + payloads (Codable structs, exhaustive):
-   `session_meta` (locale, app version, project id/name),
-   `utterance` (final text ONLY — never volatile partials),
-   `intent` (matched intent name, elided free text length),
-   `dispatch` (task id, tier, prompt kind, scaffold version — NOT the full
-   prompt; the utterance record already has the user text),
-   `agent_item` (task id, item type, payload truncated 512 chars,
-   redacted via 04),
-   `approval` (task id, tier, nonce digits, attempt texts redacted, decision,
-   duration ms),
-   `result` (task id, status, voice_summary, isFallback),
-   `error` (domain, key, message redacted).
-3. Writer: actor with an append queue; each line flushed; write failures
-   (disk full) → drop transcript writes for the session, log once, emit a
-   one-time in-app warning event (DESIGN §12) — session must keep working.
-4. Privacy switches (config, DESIGN §7.3):
-   - `store_transcripts=false` OR `retention_days=0`: records go to a
-     temp-dir file unlinked at session close (exists only for crash debugging
-     during the session; test asserts absence after close).
-   - retention_days N: sweep at app launch + every 24 h deletes session files
-     with mtime older than N days AND removes empty YYYY/MM dirs. tasks.json
-     entries for terminal+acknowledged tasks older than N days are pruned.
-5. `deleteAllNow()` — synchronous best-effort removal of all transcript files
-   + index rebuild from live tasks only; returns count for UI confirmation.
-6. Task index: atomic read/modify/write of `tasks.json` (temp+rename),
-   schema per 26's `TaskRecord` (Codable), corruption → `.corrupt-<ts>`
-   sidecar + empty index (recovery-safe, mirrors 03's policy).
-7. Reader API for the HUD/menu (last session summaries): `recentSessions(limit:)`,
-   `records(sessionID:)` — lazy line decoding, tolerant of unknown record
-   types (forward compat).
+1. Layout: `<AppSupport>/Handsfree/transcripts/YYYY/MM/<session-id>.jsonl`
+   + `<AppSupport>/Handsfree/tasks.json`; dirs `0700`, files `0600`
+   (`SupportPaths` from 03, injectable root). Session id
+   `<yyyyMMdd-HHmmss>-<4 hex>`.
+2. API (exact):
+   ```swift
+   public actor TranscriptStore {
+       public init(paths: SupportPaths, config: ConfigSnapshotProviding,
+                   redactor: Redacting, clock: any Clock<Duration>) throws
+       public func beginSession(meta: SessionMeta) async -> SessionHandle
+       public func append(_ record: TranscriptRecord, to: SessionHandle) async
+       public func endSession(_ h: SessionHandle) async
+       // task index primitives (26 owns the TaskRecord semantics):
+       public func readTaskIndex() async -> TaskIndexFile
+       public func writeTaskIndex(_ f: TaskIndexFile) async throws   // temp+rename atomic
+       // maintenance:
+       public func sweepRetention() async -> SweepResult
+       public func deletionSummary() async -> DeletionSummary        // dry-run counts (33 uses)
+       public func deleteAllNow() async -> Int                        // returns deleted file count
+       public func recentSessions(limit: Int) async -> [SessionSummary]
+       public func records(sessionID: String) async -> [TranscriptRecord]  // tolerant reader
+       public var events: AsyncStream<TranscriptStoreEvent>
+           // .writesDisabled(reason: WriteFailureReason)  — emitted at most once per session
+   }
+   public struct TaskIndexFile: Codable { public var version: Int; public var entries: [Data] }
+   // entries are opaque per-record JSON blobs; 26 encodes/decodes TaskRecord —
+   // the store guarantees atomicity + corruption recovery only.
+   ```
+3. Record envelope `{"ts": ISO8601-millis, "type": String, "v": 1, …}`;
+   Codable structs for: `session_meta` (locale, app version, project),
+   `utterance` (final text only — the API takes a `FinalUtterance` newtype
+   so volatile partials are unrepresentable), `intent` (name + free-text
+   length only), `dispatch` (task id, tier, prompt kind, scaffold version —
+   never the full prompt), `agent_item` (task id, item type, payload ≤ 512),
+   `approval` (task id, tier, nonce digits, attempt texts, decision,
+   duration ms), `result` (task id, status, voice_summary, isFallback),
+   `error` (domain, key, message).
+   **Redaction: EVERY free-text field of EVERY record type passes
+   `Redactor.redact` at append time** — utterance text, agent_item payload,
+   approval attempts, result voice_summary, error message (tests plant
+   tokens in each).
+4. Privacy switches: `store_transcripts=false` OR `retention_days=0` ⇒
+   session records go to a temp-dir file unlinked at `endSession` (asserted:
+   zero files under transcripts/ after close in BOTH modes). Otherwise
+   `sweepRetention` (at init + every 24 h via the injected clock): delete
+   session files with `mtime < now − N×86400 s` (files exactly at the
+   boundary are KEPT), remove empty YYYY/MM dirs, prune index entries whose
+   task is terminal+acknowledged and older than N days.
+5. Write failures (disk full etc., injected throwing writer in tests): drop
+   transcript writes for the rest of the session, emit
+   `.writesDisabled(.diskFull)` exactly once, keep the session alive
+   (DESIGN §12). Index write failures throw to the caller (26 owns its
+   retry policy).
+6. Corruption: unparseable `tasks.json` → rename `.corrupt-<ts>`, return
+   empty index (mirrors 03). Unknown record types skipped on read (forward
+   compat).
 
 ## Acceptance Criteria
 
 - [ ] Permissions asserted on every created dir/file.
-- [ ] All record types round-trip; unknown-type lines skipped on read.
-- [ ] Volatile-partials guard: API surface has no method accepting non-final
-      STT results (type-level: takes `FinalUtterance` newtype).
-- [ ] Retention sweep: fixture tree with old/new files → correct deletions,
-      empty-dir cleanup, index pruning (virtual clock).
-- [ ] `store_transcripts=false` leaves zero files post-session.
-- [ ] Disk-full simulation (injected throwing FileHandle) degrades per Req 3.
-- [ ] `deleteAllNow` removes everything and preserves live-task index entries.
-- [ ] Redactor (04) applied to `agent_item`/`approval`/`error` payloads
-      (test with a token-bearing payload).
+- [ ] All record types round-trip; unknown types skipped on read.
+- [ ] `FinalUtterance` newtype prevents partial persistence (compile-level).
+- [ ] Redaction test per record type (planted `sk-…`/`ghp_…` masked).
+- [ ] Retention: fixture tree old/new/boundary → correct deletions, empty-dir
+      cleanup, index pruning (virtual clock).
+- [ ] BOTH opt-out modes leave zero transcript files post-session.
+- [ ] Disk-full: single `.writesDisabled` event, session continues.
+- [ ] `deletionSummary` counts match a subsequent `deleteAllNow`; live task
+      index entries preserved.
+- [ ] Index atomicity: torn-write simulation (temp file left behind) does
+      not corrupt reads.
 
 ## Validation
 
@@ -81,8 +104,8 @@ recovery source for tasks (26) — but also the biggest privacy liability
 
 ## Non-goals
 
-Transcript viewer UI (menu/HUD show digests only in v1), export formats,
-cloud sync (never).
+TaskRecord semantics (26), transcript viewer UI, export formats, cloud sync
+(never).
 
 ## Design References
 

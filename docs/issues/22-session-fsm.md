@@ -4,88 +4,113 @@ Session state machine: pure reducer with exhaustive transition table
 
 ## Summary
 
-Implement `HandsfreeCore/SessionFSM`: the session lifecycle of DESIGN §5.1 as
-a pure, table-tested reducer `reduce(state, event) -> (state, [Effect])`, with
-timeouts driven by injected clocks.
+Implement `HandsfreeCore/SessionFSM`: the session lifecycle of DESIGN §5.1
+as a pure reducer `reduce(state, event) -> (state, [Effect])`, with timer
+effects driven by the orchestrator and approval sub-stages mirrored from the
+ApprovalEngine.
 
 ## Context
 
-The FSM is the backbone every subsystem hangs off; DESIGN §5.1 fixes its
-states, mic policy per state, and full transition table. Keeping it pure (no
-I/O) is what makes the golden-path E2E (38) and this issue's exhaustive tests
-possible in CI.
+The FSM is the backbone every subsystem hangs off; DESIGN §5.1 fixes states,
+mic policy, and transitions. Per the amended §5.1 note, approval internals
+(nonce, echo, retries, approval timeouts, screen-confirm input) live in the
+ApprovalEngine — the FSM only mirrors stage changes and consumes decisions.
 
 ## Scope
 
-- State/event/effect types + reducer + timeout scheduling model + tests.
-- Not: effect execution (28), intents (19), approval internals (21 — the FSM
-  treats approval as a sub-flow it delegates to and receives a decision from).
+- State/event/effect types + reducer + local shell types + tests. Not:
+  effect execution (28), matching (19), approval internals (21).
 
 ## Detailed Requirements
 
-1. `SessionState` enum: exactly the states of DESIGN §5.1 (including
-   `agent_running.narrating` / `.listening_limited` as an associated sub-state,
-   and `awaiting_approval` with stage). Each state exposes
-   `var micPolicy: MicPolicy (.off/.on/.paused/.warming)` matching the DESIGN
-   table (unit test asserts the whole mapping).
-2. `SessionEvent` enum (complete):
-   `hotkeyPressed, startRequested(binding: TaskBinding?), engineReady,
-   engineFailed(AudioError), utteranceFinal(String),
-   intentResolved(MatchResult), dispatchSucceeded(TaskID),
-   dispatchFailed(reason), agentEvent(TaskID, AgentEvent),
-   turnOutcome(TaskID, TurnStatusDigest), approvalDecision(ApprovalDecision),
-   ttsFinished(utteranceKind), timerFired(TimerKind), screenConfirm(Bool),
-   endRequested, fatalError(reason)`.
-3. `Effect` enum (complete):
-   `startAudio, stopAudio, pauseSTT, resumeSTT, speak(SpeakSpec),
-   playEarcon(Earcon), matchIntent(text, MatchContext), confirmDispatch(taskDraft),
-   dispatch(TurnPlan), cancelTurn(TaskID), beginApproval(ApprovalRequest),
-   resumeWithApproval(TaskID, RiskTier), bindTask(TaskID), unbindTask,
-   announcePendingQueue([TaskDigest]), startTimer(TimerKind, Duration),
-   cancelTimer(TimerKind), persist(TranscriptRecordDraft), teardown`.
-4. Transition coverage: implement EVERY row of the DESIGN §5.1 table, plus:
-   - unspecified (state, event) pairs are ignored with a debug log effect
-     (explicit `.noop(logged:)` so tests can assert intentional ignores);
-   - idle-timeout two-stage flow (30 s → continue prompt → 15 s → ending);
-   - approval timeout handling arrives as `approvalDecision(.denied(.timeout))`
-     (21 owns approval-internal timers; the FSM owns listening/idle timers —
-     document the timer ownership split);
-   - session end during `agent_running` detaches the task (effects:
-     `unbindTask, speak(bg-continue), teardown`).
-5. Timer model: reducer emits `startTimer/cancelTimer` effects; a
-   `TimerDriver` (in 28) feeds back `timerFired`. `TimerKind`:
-   `idleListening, continuePromptWindow, utteranceCap` (60 s cap belongs to
-   endpointing 09 — NOT here; document).
-6. Determinism: reducer is a pure function; state+event fully determine
-   output. Add `func validTransitions(from:) -> [SessionEvent]` used by a
-   property test that random event sequences never crash and always land in a
-   defined state.
+1. `SessionState`: exactly the DESIGN §5.1 states; `agent_running`
+   sub-state (`.narrating`/`.listeningLimited`) and `awaiting_approval`
+   stage (`.announce`/`.awaitEcho`/`.awaitScreenConfirm`) as associated
+   values. `var micPolicy: MicPolicy` (.off/.on/.paused/.warming) matching
+   the DESIGN table — the full mapping is asserted by one test.
+2. Local shell types (defined here in `HandsfreeCore/SessionFSM/Types.swift`
+   with exactly the fields the reducer needs; richer versions live in their
+   owning modules and are mapped by the orchestrator):
+   `TaskID (Int)`, `TaskBinding (.task(TaskID) | .fresh)`,
+   `TaskDigest { id, state, projectName, summaryKeyOrText }`,
+   `TurnStatusDigest (.ok(voiceSummary: String, isFallback: Bool,
+   proposedNext: String?) | .needsInput(question: String) |
+   .blocked(action: String, targetTier: RiskTier) | .failed(reasonKey:
+   String) | .cancelled | .timedOut)`,
+   `TaskDraft { utterance, project }`, `TurnPlan { binding, kind, tier,
+   utterance }`, `SpeakSpec (.template(key: String, args: [String: String])
+   | .sanitizedText(String, locale: SpeechLocale))`,
+   `TranscriptRecordDraft` (enum mirroring 27's record types).
+   Imports allowed: `HandsfreeAgent` (RiskTier, AgentEvent), nothing else
+   beyond Foundation.
+3. `SessionEvent` (complete): `hotkeyPressed`,
+   `startRequested(TaskBinding?)`, `engineReady`, `engineFailed(reasonKey)`,
+   `utteranceFinal(String)`, `intentResolved(MatchResult)`,
+   `dispatchSucceeded(TaskID)`, `dispatchFailed(reasonKey)`,
+   `agentEvent(TaskID, AgentEvent)`, `turnOutcome(TaskID, TurnStatusDigest)`,
+   `approvalStageChanged(ApprovalStage)`,
+   `approvalDecision(ApprovalDecision)`, `ttsFinished(UtteranceKind)`,
+   `timerFired(TimerKind)`, `endRequested`, `fatalError(reasonKey)`.
+   (No `screenConfirm` event — HUD clicks route to the ApprovalEngine.)
+4. `Effect` (complete): `startAudio`, `stopAudio`, `pauseSTT`, `resumeSTT`,
+   `speak(SpeakSpec, priority: SpeechPriority)`, `playEarcon(Earcon)`,
+   `matchIntent(text: String, context: MatchContextSpec)`,
+   `confirmDispatch(TaskDraft)`, `dispatch(TurnPlan)`, `cancelTurn(TaskID)`,
+   `beginApproval(taskID: TaskID, action: String, tier: RiskTier)`,
+   `resumeWithApproval(TaskID, RiskTier)`, `bindTask(TaskID)`, `unbindTask`,
+   `announcePendingQueue([TaskDigest])`, `startTimer(TimerKind, Duration)`,
+   `cancelTimer(TimerKind)`, `persist(TranscriptRecordDraft)`, `teardown`,
+   `noop(ignored: IgnoredEventNote)` — `noop` IS an enum case so tests can
+   assert intentional ignores (`IgnoredEventNote { stateName, eventName }`).
+5. Transitions: every row of the DESIGN §5.1 table, plus: unspecified
+   (state, event) pairs → `[.noop(…)]`; idle-timeout two-stage
+   (`idleListening` 30 s → continue prompt → `continuePromptWindow` 15 s →
+   ending); `approvalDecision(.approved(tier))` → dispatching via
+   `resumeWithApproval`; `approvalDecision(.denied(…))` → speaking_result
+   (denied template; task stays resumable); session end during
+   `agent_running` → effects `[unbindTask, speak(bg-continue), teardown]`.
+   `TimerKind = .idleListening | .continuePromptWindow` ONLY (utterance cap
+   is endpointing's, approval timeouts are the engine's — documented).
+6. Sanitization invariant (T3): `SpeakSpec.sanitizedText` is the only way
+   free text enters `speak`, and the reducer only ever constructs it from
+   `TurnStatusDigest` fields — which the orchestrator guarantees are
+   sanitized before reduction (documented contract; enforced by 28's tests).
+7. Coverage tooling: `SessionEventKind` (associated-value-free mirror) +
+   fixture factories for concrete events; a generated coverage matrix
+   (state × event-kind) is written by a test to
+   `.build/session-fsm-coverage.md` and the test FAILS if any DESIGN-table
+   row is missing (staleness guard).
+8. Property test: 10 000 random event sequences (seeded generator) — no
+   crash, always a defined state, every ignore is an explicit `.noop`.
 
 ## Acceptance Criteria
 
-- [ ] Table-driven test with one case per DESIGN §5.1 row (each asserts new
-      state AND full ordered effect list) — reviewer can diff table↔tests.
+- [ ] One test per DESIGN §5.1 table row asserting new state AND ordered
+      effect list (reviewer can diff table↔tests via the coverage matrix).
 - [ ] Mic-policy mapping test matches DESIGN exactly.
-- [ ] Idle-timeout two-stage sequence test (TestClock via TimerDriver stub).
-- [ ] Property test: 10 000 random event sequences, no crash, no undefined
-      state, every `.noop` is the documented-ignore kind.
-- [ ] Detach-on-end flow test (running task survives; effects exact).
-- [ ] Reducer has zero imports beyond the domain modules (no Foundation
-      process/audio/UI imports).
+- [ ] Idle-timeout two-stage sequence via direct `timerFired` events.
+- [ ] Approval mirroring: stage changes reflect engine events; decisions
+      drive resume/denied paths; no echo/nonce logic present in the reducer
+      (code review + grep for "nonce" returns nothing).
+- [ ] Detach-on-end flow test.
+- [ ] Property test green; coverage artifact generated and complete.
+- [ ] Imports limited to Foundation + HandsfreeAgent (compile-level check
+      documented).
 
 ## Validation
 
-`swift test --filter SessionFSMTests` — includes a generated coverage matrix
-(state × event) dumped as a test artifact for review.
+`swift test --filter SessionFSMTests`; coverage artifact path noted in PR.
 
 ## Dependencies
 
-12, 19 (types only: `MatchResult`, `AgentEvent`, `ApprovalDecision` shells).
+12, 19 (types only: `MatchResult`, `IntentKind`).
 
 ## Non-goals
 
-Effect execution/wiring (28), narration content (23), approval internals (21).
+Effect execution/wiring (28), narration content (23), approval internals
+(21), timer scheduling implementation (28's TimerDriver).
 
 ## Design References
 
-DESIGN.md §5.1 (authoritative table), §5.4, §6.6, §12; ADR-008, ADR-009.
+DESIGN.md §5.1 (amended approval-boundary note), §5.4, §6.6, §12; ADR-008,
+ADR-009.
