@@ -2,8 +2,9 @@
 
 - Repository: `Saber5656/handsfree`
 - Pull request: #1
-- Reviewed head: `9876834aab66b2fb0a075b42b4eac74b811c9d18`
+- Original PR head before this resolution addendum: `9876834aab66b2fb0a075b42b4eac74b811c9d18`
 - Scope: the review findings listed below are converted into normative design contracts and focused verification gates.
+- The immutable current PR head is supplied by the parent task's fresh GitHub read immediately before review/reply/resolve; any later head change invalidates this review evidence and requires a fresh review.
 - This addendum records design-level handling only; it does not claim implementation, test, build, CI, or security validation is complete.
 - Per task instruction, the PR review bot is not re-triggered after these responses/resolutions.
 
